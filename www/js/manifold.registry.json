@@ -1,0 +1,98 @@
+{
+  "_schema": "1.0",
+  "_compiled": "2026-05-04T00:00:00Z",
+  "portal": "kensgames-portal",
+  "domain": "kensgames.com",
+  "games": [
+    {
+      "id": "fasttrack",
+      "name": "FastTrack",
+      "version": "2.1.0",
+      "status": "production",
+      "path": "fasttrack/",
+      "entry": "index.html",
+      "lobby": "lobby.html",
+      "multiplayer": true,
+      "bridge": "window.__MANIFOLD__",
+      "manifold_compatibility": {
+        "bridge_included": true,
+        "state_exposed": true,
+        "postmessage_protocol": true
+      },
+      "tags": [
+        "multiplayer",
+        "board",
+        "3d"
+      ],
+      "thumbnail": "/fasttrack/assets/thumb.png"
+    },
+    {
+      "id": "starfighter",
+      "name": "StarFighter",
+      "version": "1.0.0",
+      "status": "production",
+      "path": "starfighter/",
+      "entry": "index.html",
+      "lobby": "lobby.html",
+      "multiplayer": true,
+      "bridge": "window.__MANIFOLD__",
+      "manifold_compatibility": {
+        "bridge_included": true,
+        "state_exposed": true,
+        "postmessage_protocol": true
+      },
+      "tags": [
+        "multiplayer",
+        "space",
+        "combat",
+        "3d"
+      ],
+      "thumbnail": "/starfighter/assets/thumb.png"
+    },
+    {
+      "id": "4dtictactoe",
+      "name": "4D Connect",
+      "version": "2.0.0",
+      "status": "production",
+      "path": "4DTicTacToe/",
+      "entry": "index.html",
+      "multiplayer": true,
+      "bridge": "window.__MANIFOLD__",
+      "manifold_compatibility": {
+        "bridge_included": true,
+        "state_exposed": true,
+        "postmessage_protocol": true
+      },
+      "tags": [
+        "multiplayer",
+        "strategy",
+        "4d",
+        "connect"
+      ],
+      "thumbnail": "/4DTicTacToe/assets/thumb.png"
+    },
+    {
+      "id": "brickbreaker3d",
+      "name": "BrickBreaker 3D",
+      "version": "1.0.0",
+      "status": "production",
+      "path": "brickbreaker3d/",
+      "entry": "index.html",
+      "lobby": "lobby.html",
+      "multiplayer": true,
+      "bridge": "window.__MANIFOLD__",
+      "manifold_compatibility": {
+        "bridge_included": true,
+        "state_exposed": true,
+        "postmessage_protocol": true
+      },
+      "tags": [
+        "multiplayer",
+        "arcade",
+        "physics",
+        "3d"
+      ],
+      "thumbnail": "/brickbreaker3d/assets/thumb.png"
+    }
+  ]
+}

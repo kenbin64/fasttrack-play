@@ -1,0 +1,765 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * KENSGAMES UNIFIED MULTIPLAYER CLIENT
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Single client library used by ALL games: FastTrack, BrickBreaker3D,
+ * Starfighter, ConnectIV, SwartzDiamond, CubeMarble, TicTacToe.
+ *
+ * Connects to the unified lobby-server.js on wss://kensgames.com/ws.
+ *
+ * Industry-standard game flow:
+ *   Quick Match → matchmake → auto-join → ready → play
+ *   Private     → create_session → share code → friends join → play
+ *   Browse      → list_sessions → click to join → ready → play
+ *   Invite Link → resolve_code → auto-redirect to correct game → join
+ *
+ * Usage:
+ *   const mp = new KGMultiplayer('starfighter');
+ *   mp.connect({ username: 'Ace', token: '...' });
+ *   mp.on('session_update', (session) => { ... });
+ *   mp.on('game_action', (data) => { ... });
+ *   mp.createGame({ private: true, max_players: 4 });
+ *   mp.sendAction('fire', { x: 1, y: 2 });
+ */
+
+class KGMultiplayer {
+  constructor(gameId, options) {
+    this.gameId = gameId;
+    this.options = options || {};
+    this.ws = null;
+    this.connected = false;
+    this.userId = null;
+    this.username = null;
+    this.session = null;    // current session data
+    this.sessionCode = null;
+    this.isHost = false;
+    this.gameStarted = false;
+    this.remotePlayers = new Map(); // userId → latest state
+    this.sessionList = [];
+    this._listeners = {};
+    this._reconnectTimer = null;
+    this._seq = 0;
+    this._stateInterval = null;
+    this.gameUuid = null;
+    this._hadSuccessfulConnect = false;
+    this._manualDisconnect = false;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // CONNECTION
+  // ═══════════════════════════════════════════════════════════════════════
+  _wsUrl() {
+    // Desktop/embedded override. The Electron loopback server injects
+    // window.__KG_WS_URL__ so a packaged build talks to a fixed relay instead
+    // of guessing from location (under the loopback origin we'd otherwise look
+    // like localhost and try a dev server). This is also the single seam where
+    // a future P2P/LAN-direct transport substitutes its own endpoint.
+    try {
+      if (typeof window !== 'undefined' && window.__KG_WS_URL__) return window.__KG_WS_URL__;
+    } catch (_) { /* non-browser context */ }
+    const h = location.hostname;
+    const secure = location.protocol === 'https:';
+    if (h === 'localhost' || h === '127.0.0.1') return 'ws://' + h + ':8765/ws';
+    // Some apex→www redirects (e.g. CDN/edge) break WebSocket handshakes
+    // because browsers do not follow 301s on WS upgrade. Force www.<root>
+    // when on the bare apex so the upgrade reaches nginx + lobby-server
+    // directly.
+    let host = location.host;
+    if (h === 'kensgames.com') host = 'www.kensgames.com';
+    return (secure ? 'wss://' : 'ws://') + host + '/ws';
+  }
+
+  connect(auth) {
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
+    this._manualDisconnect = false;
+    this.username = (auth && auth.username) || localStorage.getItem('display_name') || localStorage.getItem('username') || 'Player';
+
+    const freshGuestIdentity = !!(auth && auth.freshGuestIdentity);
+
+    // Prefer the same site auth token used by lobby flows so identity remains
+    // stable when the game page reconnects and can rejoin its live room.
+    let siteToken = null;
+    try { siteToken = localStorage.getItem('user_token'); } catch { /* ignore */ }
+
+    // Stable per-browser guest id, persisted in localStorage so the same browser
+    // keeps the same identity across reloads/games (no accounts).
+    let guestId = null;
+    // Explicit token override — used when the game page reconnects after a page
+    // navigation (e.g. lobby → game). Bypasses both localStorage and fresh-generate.
+    if (auth && auth.guestToken) {
+      guestId = String(auth.guestToken);
+    } else if (siteToken) {
+      guestId = String(siteToken);
+    } else if (!freshGuestIdentity) {
+      try {
+        guestId = localStorage.getItem('kg_guest_token') || localStorage.getItem('kg_guest_id');
+      } catch { /* ignore */ }
+    }
+    if (!guestId) {
+      guestId = `guest-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      if (!freshGuestIdentity) {
+        try {
+          localStorage.setItem('kg_guest_token', guestId);
+          localStorage.setItem('kg_guest_id', guestId);
+        } catch { /* ignore */ }
+      }
+    }
+    // Expose the active token so callers can persist it for cross-page handoff.
+    this._guestId = guestId;
+
+    let avatarId = (auth && (auth.avatar_id || auth.avatarId)) || null;
+    if (!avatarId) {
+      try {
+        const av = JSON.parse(localStorage.getItem('kg_avatar'));
+        avatarId = av && av.id ? av.id : null;
+      } catch { /* ignore */ }
+    }
+    const reservedBotAvatar = new Set(['🤖', 'robot', 'scifi_robot', 'custom_🤖', 'faces_🤖']);
+    if (avatarId && reservedBotAvatar.has(String(avatarId).trim())) {
+      avatarId = 'person_smile';
+    }
+
+    const attachSocket = () => {
+      const socket = new WebSocket(this._wsUrl());
+      this.ws = socket;
+
+      socket.onopen = () => {
+        this.connected = true;
+        this._hadSuccessfulConnect = true;
+        this._hideReconnectOverlay();
+        this._send({
+          type: 'guest_login',
+          token: guestId,
+          username: this.username,
+          guest_name: this.username,
+          name: this.username,
+          avatar_id: avatarId,
+        });
+        this._emit('connected');
+      };
+
+      socket.onmessage = (event) => {
+        let data = null;
+        try {
+          const raw = event && event.data;
+          if (typeof raw !== 'string') return;
+          data = JSON.parse(raw);
+        } catch (_) {
+          return;
+        }
+        if (this.connected) this._hideReconnectOverlay();
+        this._handleMessage(data);
+      };
+
+      socket.onclose = () => {
+        this.connected = false;
+        this.gameStarted = false;
+        if (!this._manualDisconnect && this._hadSuccessfulConnect && this._needsLiveConnection()) {
+          this._showReconnectOverlay('Connection lost. Reconnecting...');
+        }
+        this._emit('disconnected');
+        // Auto-reconnect only when we still need the live socket (remote humans present).
+        if (this.session && this._needsLiveConnection()) {
+          this._reconnectTimer = setTimeout(() => this.connect(auth), 3000);
+        }
+      };
+
+      socket.onerror = () => {
+        console.error('[KGMultiplayer] WebSocket connection error');
+        if ((this._hadSuccessfulConnect || this.connected) && this._needsLiveConnection()) {
+          this._showReconnectOverlay('Connection unstable. Reconnecting...');
+        }
+      };
+    };
+
+    attachSocket();
+  }
+
+  // True only when the active session contains at least one remote human peer.
+  // Solo, AI-only, and post-game sessions never need the reconnect overlay because
+  // the local game can continue offline.
+  _needsLiveConnection() {
+    const s = this.session;
+    if (!s || !Array.isArray(s.players)) return false;
+    const me = this.userId;
+    return s.players.some(p => p && !p.is_ai && p.user_id !== me);
+  }
+
+  disconnect() {
+    if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
+    if (this._stateInterval) clearInterval(this._stateInterval);
+    this._reconnectTimer = null;
+    this._stateInterval = null;
+    this.session = null;
+    this.sessionCode = null;
+    this.isHost = false;
+    this.gameStarted = false;
+    this.remotePlayers.clear();
+    this._manualDisconnect = true;
+    if (this.ws) {
+      try { this.ws.close(1000, 'client_disconnect'); } catch { /* ignore */ }
+      this.ws = null;
+    }
+    this._hideReconnectOverlay();
+    this.connected = false;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // EVENT SYSTEM
+  // ═══════════════════════════════════════════════════════════════════════
+  on(event, fn) {
+    if (!this._listeners[event]) this._listeners[event] = [];
+    this._listeners[event].push(fn);
+    return this; // chainable
+  }
+
+  off(event, fn) {
+    if (!this._listeners[event]) return;
+    this._listeners[event] = this._listeners[event].filter(f => f !== fn);
+  }
+
+  _emit(event, data) {
+    const fns = this._listeners[event];
+    if (fns) fns.forEach(fn => { try { fn(data); } catch (e) { console.error(e); } });
+  }
+
+  _send(data) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(data));
+    }
+  }
+
+  _showReconnectOverlay(message) {
+    if (typeof document === 'undefined') return;
+    let overlay = document.getElementById('kgmp-reconnect-overlay');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = 'kgmp-reconnect-overlay';
+      overlay.style.cssText = [
+        'position:fixed', 'inset:0', 'z-index:99996',
+        'background:rgba(6,10,20,0.65)',
+        'display:flex', 'align-items:center', 'justify-content:center',
+        'pointer-events:none',
+      ].join(';');
+      overlay.innerHTML = [
+        '<div style="display:flex;flex-direction:column;align-items:center;gap:10px;color:#dce5ff;">',
+        '<div style="width:36px;height:36px;border:4px solid rgba(220,229,255,0.2);border-top-color:#8ac4ff;border-radius:50%;animation:kgmpSpin 0.85s linear infinite"></div>',
+        '<div id="kgmp-reconnect-text" style="font-family:sans-serif;font-size:clamp(14px,3.6vw,18px);font-weight:600;text-align:center;"></div>',
+        '</div>'
+      ].join('');
+      const style = document.createElement('style');
+      style.id = 'kgmp-reconnect-style';
+      style.textContent = '@keyframes kgmpSpin{to{transform:rotate(360deg)}}';
+      document.head.appendChild(style);
+      document.body.appendChild(overlay);
+    }
+    const txt = document.getElementById('kgmp-reconnect-text');
+    if (txt) txt.textContent = message || 'Reconnecting...';
+    overlay.style.display = 'flex';
+  }
+
+  _hideReconnectOverlay() {
+    if (typeof document === 'undefined') return;
+    const overlay = document.getElementById('kgmp-reconnect-overlay');
+    if (overlay) overlay.style.display = 'none';
+  }
+
+  _ackPmFrame(data) {
+    if (!data || typeof data._pm_seq !== 'number') return;
+    this._send({
+      type: 'game_action_ack',
+      session_id: (this.session && this.session.session_id) || data._pm_session,
+      seq: data._pm_seq,
+      game_uuid: this.gameUuid || (this.session && this.session.game_uuid) || null,
+    });
+  }
+
+  _currentRosterSig() {
+    const s = this.session;
+    if (!s || !Array.isArray(s.players)) return '';
+    return s.players
+      .slice()
+      .sort((a, b) => (a.slot || 0) - (b.slot || 0))
+      .map((p) => `${p.slot}:${String(p.username || '').trim().toLowerCase()}`)
+      .join('|');
+  }
+
+  _applyGameObject(gameObject, sessionIdHint) {
+    if (!gameObject || typeof gameObject !== 'object') return;
+    const players = Array.isArray(gameObject.players) ? gameObject.players : [];
+
+    const legacyPlayers = players.map((p) => ({
+      user_id: p.userId,
+      username: p.name,
+      avatar_id: p.avatar,
+      is_host: !!p.isHost,
+      is_ai: !!p.isAI,
+      slot: Number(p.slot) || 0,
+      ready: !!p.isReady,
+    }));
+
+    this.session = {
+      ...(this.session || {}),
+      session_id: gameObject.sessionId || sessionIdHint || (this.session && this.session.session_id) || null,
+      session_code: gameObject.sessionCode || (this.session && this.session.session_code) || null,
+      game_id: gameObject.gameId || (this.session && this.session.game_id) || this.gameId,
+      host_id: gameObject.hostId || (this.session && this.session.host_id) || null,
+      max_players: Number(gameObject.maxPlayers) || (this.session && this.session.max_players) || 0,
+      is_private: !!gameObject.isPrivate,
+      settings: { ...(gameObject.settings || {}) },
+      status: gameObject.phase || (this.session && this.session.status) || 'waiting',
+      players: legacyPlayers,
+      player_count: legacyPlayers.length,
+    };
+
+    this.sessionCode = this.session.session_code || this.sessionCode;
+    this.isHost = this.session.host_id === this.userId;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // ROOM / SESSION MANAGEMENT
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /** Create a new game session (host) */
+  createGame(opts) {
+    this._send({
+      type: 'create_session',
+      game_id: this.gameId,
+      private: (opts && opts.private) || false,
+      max_players: (opts && (opts.max_players || opts.maxPlayers)) || undefined,
+      settings: (opts && opts.settings) || {},
+    });
+  }
+
+  /** Join by 6-char invite code */
+  joinByCode(code) {
+    this._send({ type: 'join_by_code', code: code.toUpperCase().trim() });
+  }
+
+  /** Update local profile on active socket before joining/creating session. */
+  updateProfile(profile) {
+    const name = profile && profile.username ? String(profile.username).trim() : '';
+    const avatarId = profile && (profile.avatar_id || profile.avatarId) ? String(profile.avatar_id || profile.avatarId).trim() : '';
+    if (!name && !avatarId) return;
+    if (name) this.username = name;
+    this._send({
+      type: 'update_profile',
+      username: name || undefined,
+      avatar_id: avatarId || undefined,
+    });
+  }
+
+  /** Join by session ID */
+  joinById(sessionId) {
+    this._send({ type: 'join_session', session_id: sessionId });
+  }
+
+  /** Quick matchmaking — finds or creates a public game */
+  matchmake() {
+    this._send({ type: 'matchmake', game_id: this.gameId });
+  }
+
+  /** Request the list of public sessions (optionally filtered by game) */
+  listGames(gameId) {
+    this._send({ type: 'list_sessions', game_id: gameId || this.gameId });
+  }
+
+  /** List ALL games across all types (for the portal browser) */
+  listAllGames() {
+    this._send({ type: 'list_sessions' }); // no game_id filter
+  }
+
+  /** Request the roster of players currently online (server replies `presence`) */
+  listPresence() {
+    this._send({ type: 'list_presence' });
+  }
+
+  /** Host: invite an online player to the current (waiting) session */
+  invitePlayer(userId) {
+    if (!this.session) return;
+    this._send({ type: 'invite_player', target_user_id: userId, session_id: this.session.session_id });
+  }
+
+  /** Invitee: decline an invite (best-effort notify to the host) */
+  declineInvite(sessionId) {
+    this._send({ type: 'decline_invite', session_id: sessionId });
+  }
+
+  /** Resolve a code to find which game it belongs to */
+  resolveCode(code) {
+    this._send({ type: 'resolve_code', code: code.toUpperCase().trim() });
+  }
+
+  /** Leave current session */
+  leave() {
+    this._send({ type: 'leave_session' });
+    this.session = null;
+    this.sessionCode = null;
+    this.isHost = false;
+    this.gameStarted = false;
+    this.remotePlayers.clear();
+  }
+
+  /** Host-only: cancel and tear down the current session for everyone. */
+  cancelSession() {
+    this._send({ type: 'cancel_session' });
+  }
+
+  /** Toggle ready state */
+  toggleReady() { this._send({ type: 'toggle_ready' }); }
+
+  /** Host accepts the group once everyone is ready */
+  acceptLobby() { this._send({ type: 'accept_lobby' }); }
+
+  /** Update session settings (host only) */
+  updateSettings(settings) {
+    this._send({ type: 'update_session_settings', settings });
+  }
+
+  /** Set max player limit for this session (host only). Server enforces the per-game cap. */
+  setMaxPlayers(n) {
+    const clamped = Math.max(2, parseInt(n, 10) || 2);
+    this._send({ type: 'update_session_settings', settings: {}, max_players: clamped });
+  }
+
+  /** Start the game (host only) */
+  startGame() { this._send({ type: 'start_game' }); }
+
+  /** Add an AI bot to the session (host only) */
+  addBot(difficulty) {
+    // Server supports both add_ai and add_ai_player
+    this._send({ type: 'add_ai_player', level: difficulty || 'medium' });
+  }
+
+  /** Remove an AI bot (host only) */
+  removeBot(playerId) {
+    // Server supports both remove_ai and remove_ai_player
+    this._send({ type: 'remove_ai_player', player_id: playerId });
+  }
+
+  /**
+   * Send a chat payload.
+   * - chat('hello') keeps legacy behavior.
+   * - chat({ message: 'hello', emoji_reaction: {...} }) allows rich metadata.
+   */
+  chat(messageOrPayload) {
+    if (messageOrPayload && typeof messageOrPayload === 'object') {
+      this._send(Object.assign({ type: 'chat' }, messageOrPayload));
+      return;
+    }
+    this._send({ type: 'chat', message: messageOrPayload });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // GAME STATE SYNC
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /** Send player state (position, velocity, etc.) — for real-time games */
+  sendPlayerState(state) {
+    if (!this.gameStarted || !this.connected) return;
+    this._send({ type: 'player_state', ...state });
+  }
+
+  /** Start auto-sending player state at a fixed rate */
+  startStateSync(getStateFn, hz) {
+    if (this._stateInterval) clearInterval(this._stateInterval);
+    const interval = 1000 / (hz || 20);
+    this._stateInterval = setInterval(() => {
+      if (this.gameStarted && this.connected) {
+        const state = getStateFn();
+        if (state) this.sendPlayerState(state);
+      }
+    }, interval);
+  }
+
+  stopStateSync() {
+    if (this._stateInterval) clearInterval(this._stateInterval);
+    this._stateInterval = null;
+  }
+
+  /** Send a discrete game action (fire, move piece, play card) */
+  sendAction(action, payload) {
+    if (!this.connected) return;
+    this._send({
+      type: 'game_action',
+      action,
+      payload: payload || {},
+      seq: ++this._seq,
+    });
+  }
+
+  /**
+   * Send a server-authoritative kernel action.
+   * Uses the explicit { kernel: {...} } envelope so the lobby's KernelRouter
+   * intercepts and validates it via the per-game GameRules. Plain sendAction()
+   * still falls through to legacy peer relay.
+   *
+   *   mp.sendKernelAction('drop', { col: 2, layer: 0 });
+   *   mp.sendKernelAction('settle_complete');
+   */
+  sendKernelAction(type, payload) {
+    if (!this.connected) return;
+    if (typeof type !== 'string' || !type) return;
+    this._send({
+      type: 'game_action',
+      kernel: { type, payload: payload || {} },
+      seq: ++this._seq,
+    });
+  }
+
+  /** Host-only: request a replay of the just-ended session with the same seats. */
+  sendReplayRequest() {
+    if (!this.connected) return;
+    this._send({ type: 'replay_game' });
+  }
+
+  /** Send authoritative game state snapshot (host only) */
+  sendGameState(state) {
+    if (!this.connected || !this.isHost) return;
+    this._send({
+      type: 'game_state',
+      state,
+      seq: ++this._seq,
+    });
+  }
+
+  /** Signal game over */
+  sendGameOver(result, winner, scores, message) {
+    if (!this.connected) return;
+    this._send({
+      type: 'game_over',
+      result, winner, scores, message,
+    });
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // MESSAGE HANDLER
+  // ═══════════════════════════════════════════════════════════════════════
+  _handleMessage(data) {
+    switch (data.type) {
+      case 'auth_success':
+        this.userId = (data.user && data.user.user_id) ? data.user.user_id : data.user_id;
+        this.username = (data.user && data.user.username) ? data.user.username : data.username;
+        this._emit('authenticated', { userId: this.userId, username: this.username });
+        break;
+
+      case 'session_created':
+      case 'session_update':
+      case 'session_joined':
+      case 'player_joined':
+      case 'player_left':
+      case 'ready_update':
+      case 'matchmake_result':
+      case 'session_settings_updated':
+        if (data.session) {
+          this.session = data.session;
+          this.sessionCode = data.session.session_code || this.sessionCode;
+          this.isHost = data.session.host_id === this.userId;
+          this._emit('session_update', data.session);
+        } else if (this.session) {
+          // Some legacy server events may omit a full session payload.
+          // Keep current session cache and still notify listeners to refresh.
+          this._emit('session_update', this.session);
+        }
+        if (data.share_code) this._emit('share_code', data.share_code);
+        break;
+
+      case 'session_list':
+        this.sessionList = data.sessions || [];
+        this._emit('session_list', this.sessionList);
+        break;
+
+      case 'presence':
+        this.presence = data.users || [];
+        this._emit('presence', this.presence);
+        break;
+
+      case 'game_invite':
+        this._emit('game_invite', data);
+        break;
+
+      case 'invite_sent':
+        this._emit('invite_sent', data);
+        break;
+
+      case 'invite_declined':
+        this._emit('invite_declined', data);
+        break;
+
+      case 'game_object':
+        this._applyGameObject(data.game_object, data.session_id);
+        this._emit('game_object', data.game_object);
+        if (this.session) this._emit('session_update', this.session);
+        break;
+
+      case 'resolve_code_result':
+        this._emit('code_resolved', data);
+        break;
+
+      case 'game_started':
+        this.gameStarted = true;
+        this.gameUuid = data && data.session && data.session.game_uuid ? data.session.game_uuid : this.gameUuid;
+        this._emit('game_started', data);
+        break;
+
+      case 'session_cancelled':
+        this.session = null;
+        this.sessionCode = null;
+        this.isHost = false;
+        this.gameStarted = false;
+        this._emit('session_cancelled', data);
+        break;
+
+      case 'player_reclaimed_seat':
+        if (data.players && this.session) this.session.players = data.players;
+        this._emit('player_reclaimed_seat', data);
+        if (this.session) this._emit('session_update', this.session);
+        break;
+
+      case 'player_replaced_with_bot':
+        if (data.players && this.session) this.session.players = data.players;
+        this._emit('player_replaced_with_bot', data);
+        if (this.session) this._emit('session_update', this.session);
+        break;
+
+      case 'player_state':
+        this._ackPmFrame(data);
+        if (data.user_id !== this.userId) {
+          this.remotePlayers.set(data.user_id, {
+            userId: data.user_id,
+            username: data.username,
+            ...data,
+            lastUpdate: performance.now(),
+          });
+          this._emit('player_state', data);
+        }
+        break;
+
+      case 'game_action':
+        this._ackPmFrame(data);
+        this._emit('game_action', data);
+        break;
+
+      case 'game_state':
+        this._ackPmFrame(data);
+        this._emit('game_state', data);
+        break;
+
+      case 'pm_game_ready':
+        this.gameUuid = data.game_uuid || this.gameUuid;
+        this._hideReconnectOverlay();
+        this._emit('pm_game_ready', data);
+        break;
+
+      case 'pm_resync':
+        this._showReconnectOverlay('Resyncing game state...');
+        this._emit('pm_resync', data);
+        break;
+
+      case 'pm_sync_probe': {
+        const activeSessionId = (this.session && this.session.session_id) || null;
+        const sessionId = activeSessionId || data.session_id || null;
+        const gameUuid = this.gameUuid || (this.session && this.session.game_uuid) || data.game_uuid || null;
+        this._send({
+          type: 'pm_sync_report',
+          probe_id: data.probe_id,
+          session_id: sessionId,
+          game_uuid: gameUuid,
+          instance_id: data.instance_id || null,
+          username: this.username || null,
+          roster_sig: this._currentRosterSig(),
+        });
+        this._emit('pm_sync_probe', data);
+        break;
+      }
+
+      case 'pm_sync_ok':
+        this._emit('pm_sync_ok', data);
+        break;
+
+      case 'pm_heal_ok':
+        this._hideReconnectOverlay();
+        this._emit('pm_heal_ok', data);
+        break;
+
+      case 'player_replaced_with_bot':
+        if (data.players && this.session) {
+          this.session.players = data.players;
+          this.session.player_count = data.players.length;
+        }
+        this._emit('player_replaced_with_bot', data);
+        break;
+
+      case 'game_over':
+        this.gameStarted = false;
+        this._emit('game_over', data);
+        break;
+
+      case 'kernel_state': {
+        // Server-authoritative game-kernel envelope. Inner payload is one of:
+        //   { type: 'state', state: {…} }
+        //   { type: 'turn',  activePlayerId, settled }
+        //   { type: 'game_over', winner? }
+        //   { type: 'error', error, action? }
+        const inner = data.payload || {};
+        // Always emit the raw envelope for general subscribers
+        this._emit('kernel_state', inner);
+        // Convenience re-emits keyed by inner type
+        if (inner.type) this._emit('kernel_' + inner.type, inner);
+        if (inner.type === 'game_over') {
+          this.gameStarted = false;
+          this._emit('game_over', inner);
+        }
+        break;
+      }
+
+      case 'chat':
+        this._emit('chat', data);
+        break;
+
+      case 'lobby_update':
+        this._emit('lobby_update', data);
+        break;
+
+      case 'error':
+        console.warn('[KGMultiplayer] Server error:', data.message, data);
+        // Emit the full payload so listeners can read .message, .code, .context, etc.
+        this._emit('error', data);
+        break;
+
+      default:
+        // Forward any unhandled message types for game-specific handling
+        this._emit(data.type, data);
+        break;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // CONVENIENCE GETTERS
+  // ═══════════════════════════════════════════════════════════════════════
+  get playerCount() {
+    return this.session ? this.session.player_count || this.session.players.length : 0;
+  }
+
+  get maxPlayers() {
+    return this.session ? this.session.max_players : 0;
+  }
+
+  get players() {
+    return this.session ? this.session.players : [];
+  }
+
+  get code() {
+    return this.sessionCode;
+  }
+
+  get isInGame() {
+    return this.gameStarted && this.connected;
+  }
+}
+
+// Export for both module and script-tag usage
+if (typeof window !== 'undefined') window.KGMultiplayer = KGMultiplayer;
+if (typeof module !== 'undefined') module.exports = KGMultiplayer;

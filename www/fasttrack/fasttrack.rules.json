@@ -1,0 +1,1195 @@
+{
+  "$schema": "manifold-rules/1.0",
+  "_meta": {
+    "id": "fasttrack",
+    "name": "FastTrack",
+    "version": "3.4.0",
+    "compiled": "2026-06-06",
+    "axiom": "z = x * y",
+    "supersedes": [
+      "fasttrack/fasttrack_unified_rules (v2.0)",
+      "fasttrack/fasttrack_game_spec.json (v1.0.0)",
+      "fasttrack/board_manifold.js RULE_POINTS (inline)",
+      "fasttrack/rules_substrate.js (DSL registry)",
+      "fasttrack/card_logic_substrate.js _cardDefinitions",
+      "fasttrack/Fasttrack_game_rules.json (v3.0.0)"
+    ],
+    "notes": [
+      "Single source of truth. Engine consumers must read this file and not encode parallel registries.",
+      "Geometry was previously wrong in every source: outer track has 14 holes per wedge (84 total), not 36 or 72.",
+      "Variants 5-card-draw and 2-dice are intentionally omitted in 3.0.0 — awaiting authoritative rules.",
+      "v3.1.0 (2026-05-20) folds user_directive_2026-05-20 (AI_DIRECTIVE_RULES_CLARIFICATION.md v2): bullseye now cuttable (single-occupancy); FT-ring own-peg passing removed (Option A retired); redraw cards trigger extra turn even when forfeited for no legal moves; Card-7 split FT-priority constraints relaxed to two-different-pegs only; bullseye penultimate-entry restricted to pegs already on FT; bullseye exit fallback removed (blocked = illegal); FT loss on non-FT move evaluated per-draw; new rules FT_NO_SECOND_LAP, BULL_NO_REENTRY, TURN_PLAYER_CHOICE, TURN_AUTO_PLAY, SPLIT_ANTI_TUNNELING added.",
+      "v3.2.0 (2026-05-20) folds user_directive_2026-05-20b: FT_NO_PASS_OWN_FT semantics inverted. An FT peg no longer auto-stops at own ft-{bp}; the peg consumes the FULL card value, exiting through own ft-{bp} into the home stretch (safe-{bp}-{1..4}) for any leftover hops. Engine: getTrackSequence FT-forward extended past own ft-{bp} into the stretch; calculateValidMoves now re-types the FT-exit move as 'exitFastTrack'; old truncating FT-exit loop retired. Tests updated.",
+      "v3.3.0 (2026-05-20) folds user_directive_2026-05-20e: FT_EXIT_ANY_HOLE replaces FT_NO_PASS_OWN_FT. Player choice expanded — a peg geometrically on any ft-* hole with card value N gets min(N,D)+1 stopping options where k = 0..min(N,D) is the number of inner-ring hops before LEAVING the ring back onto the outer rim; remaining N-k hops are spent clockwise on the outer rim. Reaching own ft-{bp} (k=D) FORCES exit into the home stretch consuming N-D hops there (only blocked by own peg in stretch). Engine: calculateValidMoves grows a dedicated _ftForward branch enumerating all leave-at-k options; v3.2.0 consume-full-card-on-ring semantics retired. 1-hit bullseye jump (movement===1 from foreign ft-*) remains as a separate option.",
+      "v3.3.1 (2026-05-20) extends FT_EXIT_ANY_HOLE into Card 7 split halves (user_directive_2026-05-20e). Engine: the _enumerateFtExitOptions helper is hoisted to calculateValidMoves scope and reused by the 7-split via a _halfOptions(peg, n) helper. When a split half value n is assigned to an FT peg, the half enumerates min(n,D)+1 stopping options (cartesian product with the other peg's options) instead of being forced to consume the full half on the ring. The CARD_7_FT_HANDOFF all-FT-path constraint is retired (an FT peg may now legitimately leave the ring mid-split; FT status loss is still evaluated downstream by FT_LOSS_VOLUNTARY_EXIT). FT peg cardinality rule preserved: if the player has N FT pegs, the split must use min(N,2) of them. 1-hit FT→bullseye preserved; multi-hop FT→bullseye still gated by BULL_NO_FINAL_HOP_FROM_FT_TRAVERSAL.",
+      "v3.4.0 (2026-06-06) folds user_directive_2026-06-06 (no-teleport / home-stretch correction). A peg reaching its OWN ft-{bp} via the FT ring no longer JUMPS directly into the safe zone (the old FT_EXIT_ANY_HOLE k=D direct-stretch-exit). Instead it WALKS the home stretch hole-by-hole to the safe-zone entrance (outer-{p}-8 in this file's 14-index naming = engine's outer-{bp}-2) and enters the safe zone there, exactly as SAFE_ENTRY_VIA_OWN_8 already required. This eliminates the only path-teleport in the engine: reaching the safe zone is ALWAYS a hole-by-hole journey down the home stretch, never a leap several holes ahead. (The legal cut — landing on an opponent sends THEIR peg to holding, or to home/winner if holding is full — is unchanged; that is the only sanctioned teleport.) Engine changes: _enumerateFtExitOptions now routes every k (including k=D) through walkOuter, which diverts into safe at the entrance when eligible; getTrackSequence FT-forward 'crossedOwnFt' branch walks the outer-rim home stretch instead of appending safe-{bp}-1..4; the stale literal outer-{p}-8 (which never matched the engine's outer-{p}-0..3 split naming) was corrected to outer-{p}-2 at all 5 engine sites. Sound side-effect fix: exitFastTrack no longer double-fires the generic landing sound when it lands in the safe zone (the safeZone cutscene owns that audio). Verified by test_path_contiguity.js (0 teleports across 503 walked paths), test_win_and_safezone.js (exact-landing win, overshoot dies, undershoot legal, 4-fill-before-5th), test_calculate_valid_moves.js, and the existing test_card7_splits.js fingerprint."
+    ]
+  },
+  "axes": {
+    "x": {
+      "name": "category",
+      "values": [
+        "setup",
+        "card",
+        "movement",
+        "circuit",
+        "cut",
+        "bullseye_entry",
+        "bullseye_exit",
+        "fasttrack",
+        "safezone",
+        "win",
+        "turn"
+      ]
+    },
+    "y": {
+      "name": "index_within_category"
+    },
+    "z": "x * y"
+  },
+  "board": {
+    "shape": "hexagon",
+    "wedges": 6,
+    "outer_track": {
+      "holes_per_wedge": 14,
+      "total_holes": 84,
+      "naming": "outer-{p}-{n}",
+      "wedge_indices": "p in 0..5",
+      "hole_indices": "n in 1..14",
+      "ft_hole_index": 1,
+      "corner_hole_indices": [
+        6,
+        10
+      ],
+      "safe_zone_entrance_index": 8,
+      "wedge_end_index": 14,
+      "traversal_clockwise": "outer-{p}-1 -> outer-{p}-2 -> ... -> outer-{p}-14 -> outer-{(p+1) mod 6}-1"
+    },
+    "fasttrack_ring": {
+      "holes": 6,
+      "naming": "ft-{p}",
+      "shared_with_outer_rim": true,
+      "outer_rim_position": "outer-{p}-1 (FT hole and rim hole are the SAME hole, dual role)",
+      "ring_traversal_clockwise": "ft-0 -> ft-1 -> ft-2 -> ft-3 -> ft-4 -> ft-5 -> ft-0",
+      "ft_holes_not_adjacent_on_outer_rim": true,
+      "exit_constraint": "A peg geometrically on any ft-* hole with card value N may leave the FT inner ring at hop k = 0..min(N,D), where D = ring distance to own ft-{bp}. For k<D the peg drops back onto the outer rim at ft-(X+k) and continues N-k clockwise hops on the outer rim. For k=D the peg MUST exit into own stretch (safe-{bp}-{1..4}) consuming N-D hops there; blocked only by own peg in stretch. The 1-hit bullseye jump (movement===1, from foreign ft-*) is offered independently."
+    },
+    "safe_zone": {
+      "holes_per_player": 4,
+      "naming": "safe-{p}-{1..4}",
+      "called_in_diagram": "home base row",
+      "direction": "forward_only",
+      "owner_only": true,
+      "safe_from_cuts": true,
+      "exact_landing_required": true
+    },
+    "home": {
+      "holes_per_player": 1,
+      "naming": "home-{p}",
+      "called_in_diagram": "holding pen exit",
+      "is_start_position_for_5th_peg": true,
+      "is_winner_hole": true,
+      "exact_landing_required": true,
+      "can_be_cut": true,
+      "is_cut_fallback_when_holding_full": true
+    },
+    "holding": {
+      "holes_per_player": 4,
+      "naming": "hold-{p}-{1..4}",
+      "arrangement": "circular, one per player wedge",
+      "safe_from_cuts": true
+    },
+    "bullseye": {
+      "holes": 1,
+      "naming": "center",
+      "position": "exact_geometric_center",
+      "max_pegs": 1,
+      "safe_from_cuts": false,
+      "cut_semantics": "single-occupancy: arrival of any peg cuts the resident peg back to holding (or home if holding full), regardless of color (own or opponent). No two pegs ever coexist at center.",
+      "no_reentry_after_exit": true
+    }
+  },
+  "setup": {
+    "min_players": 2,
+    "max_players": 6,
+    "max_humans_online": 4,
+    "max_ai": 3,
+    "pegs_per_player": 5,
+    "peg_start_distribution": {
+      "holding": 4,
+      "home": 1
+    },
+    "first_player": "random_or_lobby_configurable",
+    "turn_order": "clockwise by player index",
+    "deck": {
+      "type": "standard_52_plus_2_jokers",
+      "total_cards": 54,
+      "suits": [
+        "hearts",
+        "diamonds",
+        "clubs",
+        "spades"
+      ],
+      "ranks_per_suit": [
+        "A",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "J",
+        "Q",
+        "K"
+      ],
+      "jokers": 2,
+      "reshuffle_on_exhaustion": true,
+      "reshuffle_source": "discard_pile"
+    },
+    "colors": {
+      "red": {
+        "hex": "#e74c3c",
+        "wedge": 0
+      },
+      "orange": {
+        "hex": "#a0522d",
+        "wedge": 1
+      },
+      "yellow": {
+        "hex": "#f1c40f",
+        "wedge": 2
+      },
+      "green": {
+        "hex": "#27ae60",
+        "wedge": 3
+      },
+      "blue": {
+        "hex": "#3498db",
+        "wedge": 4
+      },
+      "purple": {
+        "hex": "#9b59b6",
+        "wedge": 5
+      }
+    }
+  },
+  "cards": {
+    "A": {
+      "x": 2,
+      "y": 1,
+      "z": 2,
+      "movement": 1,
+      "direction": "clockwise",
+      "extra_turn": true,
+      "can_enter_from_holding": true,
+      "can_exit_bullseye": false,
+      "is_special": true
+    },
+    "2": {
+      "x": 2,
+      "y": 2,
+      "z": 4,
+      "movement": 2,
+      "direction": "clockwise",
+      "extra_turn": false,
+      "can_enter_from_holding": false,
+      "can_exit_bullseye": false
+    },
+    "3": {
+      "x": 2,
+      "y": 3,
+      "z": 6,
+      "movement": 3,
+      "direction": "clockwise",
+      "extra_turn": false,
+      "can_enter_from_holding": false,
+      "can_exit_bullseye": false
+    },
+    "4": {
+      "x": 2,
+      "y": 4,
+      "z": 8,
+      "movement": 4,
+      "direction": "counter_clockwise",
+      "extra_turn": false,
+      "can_enter_from_holding": false,
+      "can_exit_bullseye": false,
+      "is_backward": true,
+      "ends_fasttrack_for_all_player_pegs": true
+    },
+    "5": {
+      "x": 2,
+      "y": 5,
+      "z": 10,
+      "movement": 5,
+      "direction": "clockwise",
+      "extra_turn": false,
+      "can_enter_from_holding": false,
+      "can_exit_bullseye": false
+    },
+    "6": {
+      "x": 2,
+      "y": 6,
+      "z": 12,
+      "movement": 6,
+      "direction": "clockwise",
+      "extra_turn": true,
+      "can_enter_from_holding": true,
+      "can_exit_bullseye": false,
+      "entry_movement": 0,
+      "is_special": true
+    },
+    "7": {
+      "x": 2,
+      "y": 7,
+      "z": 14,
+      "movement": 7,
+      "direction": "clockwise",
+      "extra_turn": false,
+      "can_enter_from_holding": false,
+      "can_exit_bullseye": false,
+      "can_split": true,
+      "note": "2026-09-04: classic rule restored. One playable peg moves exactly 7. With two or more playable pegs the 7 may instead be split a+b=7 across two of them, each half independently legal; both options are offered when both are legal. Engine switch: fasttrack-game-core.js SEVEN_MODE, which must match this field. The 2026-07-23 wild 1..7 variant is retired.",
+      "is_special": true,
+      "mode": "classic"
+    },
+    "8": {
+      "x": 2,
+      "y": 8,
+      "z": 16,
+      "movement": 8,
+      "direction": "clockwise",
+      "extra_turn": false,
+      "can_enter_from_holding": false,
+      "can_exit_bullseye": false
+    },
+    "9": {
+      "x": 2,
+      "y": 9,
+      "z": 18,
+      "movement": 9,
+      "direction": "clockwise",
+      "extra_turn": false,
+      "can_enter_from_holding": false,
+      "can_exit_bullseye": false
+    },
+    "10": {
+      "x": 2,
+      "y": 10,
+      "z": 20,
+      "movement": 10,
+      "direction": "clockwise",
+      "extra_turn": false,
+      "can_enter_from_holding": false,
+      "can_exit_bullseye": false
+    },
+    "J": {
+      "x": 2,
+      "y": 11,
+      "z": 22,
+      "movement": 1,
+      "direction": "clockwise",
+      "extra_turn": true,
+      "can_enter_from_holding": false,
+      "can_exit_bullseye": true,
+      "is_royal": true
+    },
+    "Q": {
+      "x": 2,
+      "y": 12,
+      "z": 24,
+      "movement": 1,
+      "direction": "clockwise",
+      "extra_turn": true,
+      "can_enter_from_holding": false,
+      "can_exit_bullseye": true,
+      "is_royal": true
+    },
+    "K": {
+      "x": 2,
+      "y": 13,
+      "z": 26,
+      "movement": 1,
+      "direction": "clockwise",
+      "extra_turn": true,
+      "can_enter_from_holding": false,
+      "can_exit_bullseye": true,
+      "is_royal": true
+    },
+    "JOKER": {
+      "x": 2,
+      "y": 14,
+      "z": 28,
+      "movement": 1,
+      "direction": "clockwise",
+      "extra_turn": true,
+      "can_enter_from_holding": true,
+      "can_exit_bullseye": false,
+      "is_special": true,
+      "is_wild": true
+    }
+  },
+  "rules": [
+    {
+      "id": "MOV_CLOCKWISE",
+      "x": 3,
+      "y": 1,
+      "z": 3,
+      "category": "movement",
+      "desc": "All movement is clockwise except Card 4 (counter-clockwise).",
+      "assertion": "card.direction === 'counter_clockwise' ? movingBackward : !movingBackward",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "rules_substrate.MOVE_001",
+        "board_manifold.R_DIRECTION",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "MOV_NO_LAND_OWN",
+      "x": 3,
+      "y": 2,
+      "z": 6,
+      "category": "movement",
+      "desc": "A peg cannot land on its own peg.",
+      "assertion": "!ctx.landsOnOwnPeg",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "rules_substrate.MOVE_002",
+        "board_manifold.R_NO_PASS_OWN",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "MOV_NO_PASS_OWN",
+      "x": 3,
+      "y": 3,
+      "z": 9,
+      "category": "movement",
+      "desc": "A peg cannot pass over its own peg on the outer rim, cannot pass or land on its own peg while traversing the inner FT ring, and cannot pass or land on its own peg in the safe zone. EXCEPTION: an own peg merely occupying an ft gateway hole does not block a peg passing through that hole on the outer rim, because ft holes are shared rim/ring gateways (shipped, tested behavior).",
+      "assertion": "!ctx.pathBlockedByOwnPeg (intermediate ft-* gateway holes are exempt on a rim walk: an own peg on an ft hole does not block a rim pass-through; the inner ft ring still blocks own pegs)",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "rules_substrate.MOVE_002",
+        "board_manifold.R_NO_PASS_OWN",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "MOV_EXACT_COUNT",
+      "x": 3,
+      "y": 4,
+      "z": 12,
+      "category": "movement",
+      "desc": "Step count must equal card movement value (no over- or under-counting).",
+      "assertion": "ctx.steps === ctx.card.movement || (ctx.card.rank==='6' && ctx.moveType==='enter' && ctx.steps===0) || (ctx.card.rank==='7' && ctx.isSplit)",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json"
+      ]
+    },
+    {
+      "id": "CIR_OWN_FT",
+      "x": 4,
+      "y": 1,
+      "z": 4,
+      "category": "circuit",
+      "desc": "Touching or landing on own FT hole completes the circuit.",
+      "assertion": "ctx.peg.passes(ownFtHole) || ctx.peg.lands(ownFtHole) ==> peg.completedCircuit = true",
+      "provenance": [
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "CIR_SAFE_ENTRANCE",
+      "x": 4,
+      "y": 2,
+      "z": 8,
+      "category": "circuit",
+      "desc": "Touching or passing safe-zone-entrance hole (outer-{p}-8) completes the circuit.",
+      "assertion": "ctx.peg.passes('outer-'+p+'-8') || ctx.peg.lands('outer-'+p+'-8') ==> peg.completedCircuit = true",
+      "provenance": [
+        "user_directive_2026-04-25",
+        "unified_rules.card_4.backward_past_safe_entry_satisfies_circuit"
+      ]
+    },
+    {
+      "id": "CIR_BACKWARD_4",
+      "x": 4,
+      "y": 3,
+      "z": 12,
+      "category": "circuit",
+      "desc": "Card 4 landing on or past own safe-zone-entrance going backward also completes circuit.",
+      "assertion": "ctx.movingBackward && (ctx.lands('outer-'+p+'-8') || ctx.passes('outer-'+p+'-8')) ==> peg.completedCircuit = true",
+      "provenance": [
+        "unified_rules.card_4.backward_past_safe_entry_satisfies_circuit",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "CUT_ON_LANDING",
+      "x": 5,
+      "y": 1,
+      "z": 5,
+      "category": "cut",
+      "desc": "Landing on an opponent peg on the final step of a move cuts that peg.",
+      "assertion": "ctx.landsOnOpponent && ctx.isFinalStep ==> opponent.peg.sentToHolding",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "rules_substrate.CUT_001",
+        "board_manifold.R_CUT_OPPONENT",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "CUT_DEST_HOLDING",
+      "x": 5,
+      "y": 2,
+      "z": 10,
+      "category": "cut",
+      "desc": "Cut peg returns to any open hole in opponent's holding area.",
+      "assertion": "cut.destination = first_open(opponent.holding)",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "rules_substrate.CUT_001",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "CUT_DEST_HOME_FALLBACK",
+      "x": 5,
+      "y": 3,
+      "z": 15,
+      "category": "cut",
+      "desc": "If opponent's holding area is full, cut peg returns to opponent's home/winner hole.",
+      "assertion": "all_full(opponent.holding) ==> cut.destination = opponent.home",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "CUT_SAFE_ZONES",
+      "x": 5,
+      "y": 4,
+      "z": 20,
+      "category": "cut",
+      "desc": "Cannot cut pegs in holding or safe zone. Bullseye IS cuttable per single-occupancy rule: any arriving peg displaces the resident peg back to holding (home fallback if holding full). This applies whether arrival is own or opponent and whether by direct entry from FT or by bullseye-exit landing reroute.",
+      "assertion": "destRules.canBeCut === true || destHole === 'center'",
+      "provenance": [
+        "unified_rules",
+        "rules_substrate.CUT_002",
+        "board_manifold.R_CUT_SAFE_ZONES",
+        "user_directive_2026-04-25",
+        "user_directive_2026-05-20.bullseye_cuttable"
+      ]
+    },
+    {
+      "id": "BULL_ENTRY_FROM_FT",
+      "x": 6,
+      "y": 1,
+      "z": 6,
+      "category": "bullseye_entry",
+      "desc": "Bullseye can only be entered from an FT hole.",
+      "assertion": "moveType==='enter_bullseye' ==> from(path).startsWith('ft-')",
+      "provenance": [
+        "user_directive_2026-04-25",
+        "rules_substrate.MOVE_005"
+      ]
+    },
+    {
+      "id": "BULL_ENTRY_1STEP_FT",
+      "x": 6,
+      "y": 2,
+      "z": 12,
+      "category": "bullseye_entry",
+      "desc": "Peg already on FT can enter bullseye with any 1-step card (A, J, Q, K, Joker), as final step, clockwise.",
+      "assertion": "peg.onFasttrack && card.movement===1 && card.direction==='clockwise' && lastStep==='center'",
+      "provenance": [
+        "user_directive_2026-04-25",
+        "unified_rules.fasttrack.bullseye_entry_from_fasttrack"
+      ]
+    },
+    {
+      "id": "BULL_ENTRY_PENULTIMATE",
+      "x": 6,
+      "y": 3,
+      "z": 18,
+      "category": "bullseye_entry",
+      "desc": "DEPRECATED in v3.1.0. Bullseye entry requires the peg to ALREADY be on a FT hole at the start of the move; multi-step paths from outer rim that pass through a FT hole into bullseye are NOT a legal entry route. See BULL_ENTRY_1STEP_FT and BULL_ENTRY_FROM_FT.",
+      "assertion": "!peg.onFasttrack ==> illegal_bullseye_entry",
+      "provenance": [
+        "user_directive_2026-04-25",
+        "user_directive_2026-05-20.bullseye_entry_requires_peg_starts_on_ft"
+      ]
+    },
+    {
+      "id": "BULL_NO_BACKWARD",
+      "x": 6,
+      "y": 4,
+      "z": 24,
+      "category": "bullseye_entry",
+      "desc": "Cannot enter bullseye going counter-clockwise (Card 4).",
+      "assertion": "!(card.rank==='4' && lastStep==='center')",
+      "provenance": [
+        "unified_rules",
+        "rules_substrate.CARD_004",
+        "board_manifold.R_BACKWARD_RESTRICTED",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "BULL_MAX_ONE_PEG",
+      "x": 6,
+      "y": 5,
+      "z": 30,
+      "category": "bullseye_entry",
+      "desc": "Bullseye holds at most one peg at a time.",
+      "assertion": "count(pegs.at('center')) <= 1",
+      "provenance": [
+        "unified_rules.bullseye.while_inside",
+        "rules_substrate.MOVE_005"
+      ]
+    },
+    {
+      "id": "BULL_EXIT_JQK_ONLY",
+      "x": 7,
+      "y": 1,
+      "z": 7,
+      "category": "bullseye_exit",
+      "desc": "Only J, Q, K can exit the bullseye. Ace and Joker CANNOT.",
+      "assertion": "card.rank in ['J','Q','K']",
+      "provenance": [
+        "unified_rules",
+        "board_manifold.R_BULLSEYE_EXIT",
+        "rules_substrate.MOVE_005",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "BULL_EXIT_TARGET",
+      "x": 7,
+      "y": 2,
+      "z": 14,
+      "category": "bullseye_exit",
+      "desc": "Default exit destination = player's own FT hole.",
+      "assertion": "exit.target = 'ft-'+playerIdx",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "BULL_EXIT_FALLBACK",
+      "x": 7,
+      "y": 3,
+      "z": 21,
+      "category": "bullseye_exit",
+      "desc": "REMOVED in v3.1.0. No CCW fallback. If own FT hole / own home-stretch entrance is occupied by an own peg, the bullseye-exit move is illegal (own pegs block per MOV_NO_LAND_OWN). Player must select a different legal move; if none, forfeit the J/Q/K card per TURN_NO_LEGAL_MOVE.",
+      "assertion": "ownPegOn(exitTarget) ==> illegal",
+      "provenance": [
+        "unified_rules.bullseye.if_own_ft_occupied",
+        "game_spec.json",
+        "user_directive_2026-04-25",
+        "user_directive_2026-05-20.bullseye_exit_no_fallback"
+      ]
+    },
+    {
+      "id": "BULL_EXIT_TO_OUTER_RIM",
+      "x": 7,
+      "y": 4,
+      "z": 28,
+      "category": "bullseye_exit",
+      "desc": "After bullseye exit, peg occupies the FT hole's outer-rim position; peg does NOT regain FastTrack status. Peg continues clockwise on the outer rim.",
+      "assertion": "exit ==> peg.onFasttrack = false; peg.holeId = 'outer-'+ftIdx+'-1'",
+      "provenance": [
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "BULL_EXIT_CUT_OPP",
+      "x": 7,
+      "y": 5,
+      "z": 35,
+      "category": "bullseye_exit",
+      "desc": "If exit destination has an opponent peg, cut them per CUT_ON_LANDING / CUT_DEST_* rules.",
+      "assertion": "opponentOn(target) ==> apply(CUT_ON_LANDING)",
+      "provenance": [
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "FT_ENTRY_EXACT",
+      "x": 8,
+      "y": 1,
+      "z": 8,
+      "category": "fasttrack",
+      "desc": "FT entry: exact landing on an FT hole as the final step of a clockwise move.",
+      "assertion": "lastStep.startsWith('ft-') && !movingBackward && ctx.isFinalStep ==> peg.onFasttrack = true",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "rules_substrate.MOVE_004",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "FT_SUPPRESS_AT_OWN_FT",
+      "x": 8,
+      "y": 1.5,
+      "z": 12,
+      "category": "fasttrack",
+      "desc": "If a peg begins its move on its own ft-{bp}, it is treated as being on the outer rim, not on the FT ring. No FT ring hops are generated. No k=D forced stretch exit is generated. No bullseye entry option is generated. Peg must move on the outer rim (clockwise or backward-4). Safe-zone entry allowed only via exact landing on outer-{p}-8 after completedCircuit.",
+      "assertion": "ctx.moveStart && peg.holeId === ('ft-'+bp) ==> { peg.onFasttrack = false; suppressFTExitOptions = true; suppressBullseyeEntry = true; movementMode = 'outer_rim_only'; }",
+      "provenance": [
+        "user_directive_2026-06-04",
+        "geometry.ft_circuit_completion",
+        "bullseye_entry_requires_ft_status",
+        "outer_rim_continuation_after_ft"
+      ]
+    },
+    {
+      "id": "FT_NO_BACKWARD_ENTRY",
+      "x": 8,
+      "y": 2,
+      "z": 16,
+      "category": "fasttrack",
+      "desc": "Cannot enter FastTrack going backward. Card 4 landing on an FT hole does NOT confer FT status.",
+      "assertion": "movingBackward && lastStep.startsWith('ft-') ==> peg.onFasttrack = false (peg stays on outer rim)",
+      "provenance": [
+        "unified_rules",
+        "rules_substrate.MOVE_004",
+        "board_manifold.R_BACKWARD_RESTRICTED",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "FT_RING_CLOCKWISE",
+      "x": 8,
+      "y": 3,
+      "z": 24,
+      "category": "fasttrack",
+      "desc": "Inner FT ring is traversed clockwise only.",
+      "assertion": "ftRing.direction === 'clockwise'",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "FT_EXIT_ANY_HOLE",
+      "x": 8,
+      "y": 4,
+      "z": 32,
+      "category": "fasttrack",
+      "desc": "A peg geometrically on any ft-X hole (regardless of peg.onFasttrack flag) with card value N receives up to min(N,D)+1 distinct stopping options, where D = (bp - X + 6) mod 6 is the ring distance to the player's own ft-{bp}. For each k = 0..min(N,D) the peg makes k clockwise hops on the inner FT ring, then 'leaves' the ring at ft-((X+k) mod 6) back onto the outer rim and walks the remaining N-k hops clockwise on the outer rim. This is the SAME contiguous outer-rim walk for EVERY k. For k=D the peg leaves at its OWN ft-{bp} and walks its home stretch (engine: side-left-{bp}-4..1 -> outer-{bp}-0,1; this file's 14-index naming: outer-{bp}-2..7), diverting INTO the safe zone at the safe-zone entrance (outer-{p}-8 = engine outer-{bp}-2) per SAFE_ENTRY_VIA_OWN_8 when the peg has completedCircuit. There is NO direct jump from ft-{bp} into safe-{bp}-1: reaching the safe zone is always a hole-by-hole journey down the home stretch (user_directive_2026-06-06, no-teleport rule). If the player's safe zone is FULL, the home stretch instead continues 2 holes past the entrance to the home/winner hole (outer-{p}-9 then outer-{p}-10 = home-{bp}), exact landing required (WIN_NO_OVERSHOOT). When D=0 (peg already AT own ft-{bp}) the single option is the home-stretch walk of N hops (k=0). Ring hops are blocked by an own peg sitting on the next ft-* destination (canAdvanceFastTrackStep). Outer-rim continuation uses normal MOV_NO_PASS_OWN / MOV_NO_LAND_OWN blocking. The 1-hit bullseye jump (movement===1 from foreign ft-*) is offered as a separate option, independent of this enumeration. Supersedes FT_NO_PASS_OWN_FT (v3.2.0) and the v3.2.0/v3.3.0 direct-stretch-exit at k=D (v3.4.0).",
+      "assertion": "peg.holeId.startsWith('ft-') && dir==='clockwise' && !rules.noFastTrack ==> for k in 0..min(N,D): emit exitFastTrack at walkOuter(ft-((X+k) mod 6), N-k).dest, where walkOuter diverts into safe-{bp}-* at the entrance outer-{p}-8 when eligible (k=D walks the OWN home stretch and so is eligible this move) and yields the outer-{p}-9,10 home/winner terminal when the safe zone is full; ring blocked by own peg on next ft-* halts enumeration; NO direct ft-{bp}->safe-{bp}-1 jump",
+      "provenance": [
+        "user_directive_2026-04-25",
+        "user_directive_2026-05-20b",
+        "user_directive_2026-05-20e"
+      ]
+    },
+    {
+      "id": "FT_NO_JUMP_TO_NEXT",
+      "x": 8,
+      "y": 5,
+      "z": 40,
+      "category": "fasttrack",
+      "desc": "A peg cannot jump from its own FT hole to the next player's FT hole. (Bug fix: bullseye exit must not allow this.)",
+      "assertion": "exit_target !== nextPlayer.ftHole",
+      "provenance": [
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "FT_LOSS_ON_4",
+      "x": 8,
+      "y": 6,
+      "z": 48,
+      "category": "fasttrack",
+      "desc": "Drawing a 4 ends FastTrack status for ALL of the player's pegs currently on FT. Rationale: the player may choose any peg to move backward 4 — even a non-FT peg — and any such choice constitutes 'choosing a move besides traversing FT,' which forfeits FT for every FT peg. Treating Card 4 as a blanket strip avoids ambiguity about which peg was moved.",
+      "assertion": "card.rank==='4' && player.has_pegs_on_ft ==> all_player_ft_pegs.onFasttrack = false",
+      "provenance": [
+        "unified_rules.fasttrack.losing_fasttrack.on_4_card",
+        "rules_substrate.SPECIAL_003",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "FT_LOSS_ON_NON_FT_MOVE",
+      "x": 8,
+      "y": 7,
+      "z": 56,
+      "category": "fasttrack",
+      "desc": "Any single DRAW in which the player has FT pegs but chooses to move a non-FT peg (or splits without using all available FT pegs per CARD_7_SPLIT scope) immediately ends FT status for ALL of that player's FT pegs. Evaluated per-draw (atomic event), NOT deferred to end-of-turn. A turn may contain multiple draws when redraw cards are played; each draw is evaluated independently.",
+      "assertion": "per_draw: moved_non_ft_peg && player.had_ft_pegs_at_draw_start ==> all_player_ft_pegs.onFasttrack = false",
+      "provenance": [
+        "unified_rules.fasttrack.losing_fasttrack.on_non_ft_move",
+        "rules_substrate.SPECIAL_003",
+        "user_directive_2026-04-25",
+        "user_directive_2026-05-20.per_draw_not_per_turn"
+      ]
+    },
+    {
+      "id": "FT_LOSS_VOLUNTARY_EXIT",
+      "x": 8,
+      "y": 8,
+      "z": 64,
+      "category": "fasttrack",
+      "desc": "Voluntary move from FT hole onto outer rim ends FT status for that peg.",
+      "assertion": "fromFtHole && toOuterRimNonFt ==> peg.onFasttrack = false",
+      "provenance": [
+        "unified_rules.fasttrack.losing_fasttrack.on_voluntary_exit"
+      ]
+    },
+    {
+      "id": "SAFE_ENTRY_VIA_OWN_8",
+      "x": 9,
+      "y": 1,
+      "z": 9,
+      "category": "safezone",
+      "desc": "Safe zone entry only via own safe-zone-entrance hole (outer-{p}-8) AND only when peg has completedCircuit.",
+      "assertion": "to.startsWith('safe-'+p) ==> peg.completedCircuit && fromHole==='outer-'+p+'-8'",
+      "provenance": [
+        "unified_rules",
+        "rules_substrate.MOVE_006",
+        "board_manifold.R_SAFE_CIRCUIT",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "SAFE_FORWARD_ONLY",
+      "x": 9,
+      "y": 2,
+      "z": 18,
+      "category": "safezone",
+      "desc": "Movement inside safe zone is forward only. Card 4 cannot back into or within safe zone.",
+      "assertion": "in_safe_zone && movingBackward ==> illegal",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "rules_substrate.SPECIAL_002",
+        "board_manifold.R_SAFE_FORWARD",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "SAFE_OWNER_ONLY",
+      "x": 9,
+      "y": 3,
+      "z": 27,
+      "category": "safezone",
+      "desc": "Only the owning player can occupy their own safe zone holes.",
+      "assertion": "to.startsWith('safe-'+q) && q!==playerIdx ==> illegal",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "rules_substrate.MOVE_006",
+        "board_manifold.R_SAFE_OWNER"
+      ]
+    },
+    {
+      "id": "SAFE_FROM_CUTS",
+      "x": 9,
+      "y": 4,
+      "z": 36,
+      "category": "safezone",
+      "desc": "Pegs in own safe zone cannot be cut.",
+      "assertion": "destHole.startsWith('safe-') ==> destRules.canBeCut = false",
+      "provenance": [
+        "unified_rules",
+        "rules_substrate.CUT_002",
+        "board_manifold.HOLE_KINDS.safezone"
+      ]
+    },
+    {
+      "id": "SAFE_EXACT_LANDING",
+      "x": 9,
+      "y": 5,
+      "z": 45,
+      "category": "safezone",
+      "desc": "Safe zone moves require exact landing (no overshoot).",
+      "assertion": "in_safe_zone && ctx.overshoots ==> illegal",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "board_manifold.R_EXACT_LANDING"
+      ]
+    },
+    {
+      "id": "SAFE_PASS_TO_HOME",
+      "x": 9,
+      "y": 6,
+      "z": 54,
+      "category": "safezone",
+      "desc": "When all 4 own safe-zone holes are filled by own pegs, the 5th peg may move from outer-{p}-8 directly to home/winner ONLY as an exact-landing CLOCKWISE winning move (the safe zone branch is bypassed because all four slots are filled). Backward-4 winning is NOT permitted (would require a second lap past home, forbidden by FT_NO_SECOND_LAP).",
+      "assertion": "safeZoneFull && peg.completedCircuit && !movingBackward && exactLanding(home) ==> WIN",
+      "provenance": [
+        "user_directive_2026-04-25",
+        "user_directive_2026-05-20.no_backward_4_winning_move"
+      ]
+    },
+    {
+      "id": "WIN_CONDITION",
+      "x": 10,
+      "y": 1,
+      "z": 10,
+      "category": "win",
+      "desc": "Win = 4 own pegs occupy own safe zone (safe-{p}-1..4) AND 5th peg lands EXACTLY on own home/winner hole.",
+      "assertion": "count(player.pegs in safe-{p}-1..4)===4 && one_peg_lands_exactly(home-{p})",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "rules_substrate.WIN_001",
+        "board_manifold.R_WIN",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "WIN_CIRCUIT_REQUIRED",
+      "x": 10,
+      "y": 2,
+      "z": 20,
+      "category": "win",
+      "desc": "5th peg must have completedCircuit before its winning landing on home/winner counts.",
+      "assertion": "winningPeg.completedCircuit === true",
+      "provenance": [
+        "board_manifold.R_WIN",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "WIN_NO_OVERSHOOT",
+      "x": 10,
+      "y": 3,
+      "z": 30,
+      "category": "win",
+      "desc": "5th peg cannot move past home/winner hole. Move must be exact-landing or it is illegal. (BUG FIX target.)",
+      "assertion": "movingTowardHome && ctx.overshoots(home-{p}) ==> illegal",
+      "provenance": [
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "WIN_GAME_ENDS",
+      "x": 10,
+      "y": 4,
+      "z": 40,
+      "category": "win",
+      "desc": "Game ends immediately when WIN_CONDITION is satisfied.",
+      "assertion": "WIN_CONDITION ==> game.over = true",
+      "provenance": [
+        "unified_rules",
+        "rules_substrate.WIN_002"
+      ]
+    },
+    {
+      "id": "TURN_PHASES",
+      "x": 11,
+      "y": 1,
+      "z": 11,
+      "category": "turn",
+      "desc": "Turn phases: draw -> play -> end (with extra-turn check before end).",
+      "assertion": "phases === ['draw','play','extra_turn_check','end']",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "rules_substrate.TURN_001"
+      ]
+    },
+    {
+      "id": "TURN_DRAW_ONE",
+      "x": 11,
+      "y": 2,
+      "z": 22,
+      "category": "turn",
+      "desc": "Player draws exactly 1 card per turn (single-card-draw is the canonical 3.0 variant).",
+      "assertion": "draw.count === 1",
+      "provenance": [
+        "unified_rules.variants.single_card_draw",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "TURN_MANDATORY_MOVE",
+      "x": 11,
+      "y": 3,
+      "z": 33,
+      "category": "turn",
+      "desc": "If any legal move exists, the player must make one.",
+      "assertion": "legalMoves.length > 0 ==> player.must_move",
+      "provenance": [
+        "rules_substrate.TURN_002",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "TURN_NO_LEGAL_MOVE",
+      "x": 11,
+      "y": 4,
+      "z": 44,
+      "category": "turn",
+      "desc": "If no legal move exists, discard the card. Extra turn is determined by CARD_REDRAW_SET membership ONLY — NOT by whether a legal move was played. A forfeited redraw card (A, 6, J, Q, K, Joker) still grants the redraw and the turn continues; a forfeited non-redraw card ends the turn.",
+      "assertion": "legalMoves.length === 0 ==> discard(card); extraTurn = (card.rank in CARD_REDRAW_SET); if (!extraTurn) endTurn()",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "rules_substrate.TURN_003",
+        "user_directive_2026-04-25",
+        "user_directive_2026-05-20.redraw_triggers_regardless_of_forfeit"
+      ]
+    },
+    {
+      "id": "TURN_EXTRA",
+      "x": 11,
+      "y": 5,
+      "z": 55,
+      "category": "turn",
+      "desc": "Cards A, 6, J, Q, K, Joker grant an extra turn (redraw) whenever played, regardless of whether a legal move was executed or the card was forfeited for having no legal moves. Membership in CARD_REDRAW_SET is the sole condition.",
+      "assertion": "card.rank in ['A','6','J','Q','K','JOKER'] ==> extraTurn = true",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "rules_substrate.SPECIAL_001",
+        "card_logic_substrate.grantsExtraTurn",
+        "user_directive_2026-04-25",
+        "user_directive_2026-05-20.redraw_on_forfeit_too"
+      ]
+    },
+    {
+      "id": "TURN_DECK_RESHUFFLE",
+      "x": 11,
+      "y": 6,
+      "z": 66,
+      "category": "turn",
+      "desc": "When the deck is empty, shuffle the discard pile to form the new deck.",
+      "assertion": "deck.empty ==> deck = shuffle(discard)",
+      "provenance": [
+        "unified_rules",
+        "rules_substrate.TURN_004"
+      ]
+    },
+    {
+      "id": "CARD_ENTRY_TRIO",
+      "x": 2,
+      "y": 15,
+      "z": 30,
+      "category": "card",
+      "desc": "Only Ace, 6, and Joker can bring a peg from holding to the home/winner hole.",
+      "assertion": "moveType==='enter' ==> card.rank in ['A','6','JOKER']",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "rules_substrate.CARD_001/005/007",
+        "board_manifold.R_ENTER_CARD",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "CARD_ENTRY_HOME_FREE",
+      "x": 2,
+      "y": 16,
+      "z": 32,
+      "category": "card",
+      "desc": "Cannot enter from holding if home/winner hole is occupied by own peg.",
+      "assertion": "moveType==='enter' && ownPegOn(home-{p}) ==> illegal",
+      "provenance": [
+        "unified_rules",
+        "rules_substrate.MOVE_003",
+        "board_manifold.R_ENTER_HOME_FREE",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "CARD_6_DUAL",
+      "x": 2,
+      "y": 17,
+      "z": 34,
+      "category": "card",
+      "desc": "Card 6: entry from holding = 0-step place on home; otherwise move existing peg 6 spaces clockwise.",
+      "assertion": "card.rank==='6' && moveType==='enter' ==> steps=0; otherwise steps=6",
+      "provenance": [
+        "unified_rules.card_6",
+        "game_spec.json.card_6",
+        "rules_substrate.CARD_005",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "CARD_4_BACKWARD",
+      "x": 2,
+      "y": 18,
+      "z": 36,
+      "category": "card",
+      "desc": "Card 4 moves 4 spaces counter-clockwise. Cannot enter FT mode, bullseye, or safe zone via this move.",
+      "assertion": "card.rank==='4' ==> direction='counter_clockwise' && !entersFt && !entersBullseye && !entersSafeZone",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "rules_substrate.CARD_004",
+        "board_manifold.R_BACKWARD_RESTRICTED",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "CARD_7_FORWARD_ONLY",
+      "x": 2,
+      "y": 19,
+      "z": 38,
+      "category": "card",
+      "desc": "Card 7 may only use forward-legal hops. Pegs in holding cannot participate and cannot move backward. A Card 7 turn is legal only if at least onepeg in play (not in holding) can make a forward-legal hop. If the player has only one peg in play, that peg must perform all 7 forward-legal hops; if it cannot, the card is forfeited.",
+      "assertion": "card.rank==='7' ==> !movingBackward && pegs_in_play>=1 && (pegs_in_play===1 ? !isSplit : true)",
+      "provenance": [
+        "user_directive_2026-06-04",
+        "fasttrack.card_7_forward_only"
+      ]
+    },
+    {
+      "id": "CARD_7_FT_PRIORITY",
+      "x": 2,
+      "y": 19.5,
+      "z": 39,
+      "category": "card",
+      "desc": "In a Card 7 split, if Peg A begins the split on FastTrack, Peg A must reach its own ft-{bp} to keep FastTrack status. If Peg A does not reach its own ft-{bp} and Peg B is moved (Peg B is not on FastTrack), then Peg A immediately loses FastTrack status and becomes an outer-rim peg for the remainder of the game. If both Peg A and Peg B are on FastTrack, both may move without Peg A losing FastTrack status (subject to normal FT no-pass/no-land-on-own rules).",
+      "assertion": "isSplit && P1.onFasttrack === true && !P1.passes(ownFtHole) && P2.onFasttrack === false ==> { P1.onFasttrack = false; P1.fasttrackEntryHole = null; P1.mustExitFasttrack = false; }",
+      "provenance": [
+        "user_directive_2026-06-04",
+        "fasttrack.card_7_ft_priority"
+      ]
+    },
+    {
+      "id": "FT_RING_PASS_RELAX",
+      "x": 8,
+      "y": 9,
+      "z": 72,
+      "category": "fasttrack",
+      "desc": "FT-ring blocking (the 'Option A' relax was retired in v3.1.0). Own pegs block on the inner FT ring: a peg cannot pass OR land on another peg of its own color while traversing the ring. EXCEPTION (shipped, tested behavior, confirmed 2026-06): an own peg occupying an ft gateway hole does NOT block a peg passing through that hole on the OUTER RIM, since ft holes are shared rim/ring gateways. Only opponent pegs are passable on the ring (and cuttable on landing). The name is historical; this rule governs ring blocking, not a relax.",
+      "assertion": "(traversing the FT ring && pegOn(path_step).color === actingPeg.color) ==> illegal; (rim pass-through of an ft gateway hole occupied by an own peg) ==> allowed",
+      "provenance": [
+        "user_directive_2026-04-25.option_a_ft_passing_relax",
+        "user_directive_2026-05-20.option_a_retired_own_pegs_block_universally"
+      ]
+    },
+    {
+      "id": "CARD_BULL_EXIT_SET",
+      "x": 2,
+      "y": 22,
+      "z": 44,
+      "category": "card",
+      "desc": "Only J, Q, K can exit bullseye (NOT Ace, NOT Joker).",
+      "assertion": "moveType==='bullseye_exit' ==> card.rank in ['J','Q','K']",
+      "provenance": [
+        "unified_rules",
+        "rules_substrate.MOVE_005",
+        "board_manifold.R_BULLSEYE_EXIT",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "CARD_ONE_STEP_SET",
+      "x": 2,
+      "y": 23,
+      "z": 46,
+      "category": "card",
+      "desc": "1-move cards = A, J, Q, K, Joker.",
+      "assertion": "card.movement===1 <==> card.rank in ['A','J','Q','K','JOKER']",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "CARD_REDRAW_SET",
+      "x": 2,
+      "y": 24,
+      "z": 48,
+      "category": "card",
+      "desc": "Redraw (extra-turn) cards = A, 6, J, Q, K, Joker.",
+      "assertion": "card.extra_turn===true <==> card.rank in ['A','6','J','Q','K','JOKER']",
+      "provenance": [
+        "unified_rules",
+        "game_spec.json",
+        "rules_substrate.SPECIAL_001",
+        "card_logic_substrate.grantsExtraTurn",
+        "user_directive_2026-04-25"
+      ]
+    },
+    {
+      "id": "FT_NO_SECOND_LAP",
+      "x": 8,
+      "y": 10,
+      "z": 80,
+      "category": "fasttrack",
+      "desc": "No peg may complete a second lap of the outer track OR a second lap of the FT ring. Once a peg has armed (completedCircuit=true) by touching/passing outer-{p}-8, it must enter its safe zone on its next legal arrival at outer-{p}-8 (or take the 5th-peg path per SAFE_PASS_TO_HOME). Once an FT peg passes its own ft-{p} hole, it must exit there to home-stretch; the engine forbids overshoot. Cards that would cause a second lap are illegal moves and (if no alternative exists) trigger TURN_NO_LEGAL_MOVE.",
+      "assertion": "(peg.completedCircuit && passesAgain('outer-'+p+'-8') && !entersSafe) ==> illegal; (peg.onFasttrack && passes(ownFtHole) && !exits) ==> illegal",
+      "provenance": [
+        "user_directive_2026-05-20.F1_F4_R17"
+      ]
+    },
+    {
+      "id": "BULL_NO_REENTRY",
+      "x": 6,
+      "y": 6,
+      "z": 36,
+      "category": "bullseye_entry",
+      "desc": "Once a peg has exited the bullseye via J/Q/K, it may NOT re-enter the bullseye in the same game. Bullseye is a one-time visit per peg. Engine must track per-peg `bullseyeVisited` flag; arrival logic must reject any future bullseye entry for that peg.",
+      "assertion": "peg.bullseyeVisited === true ==> illegal_bullseye_entry",
+      "provenance": [
+        "user_directive_2026-05-20.F2_bullseye_no_reentry"
+      ]
+    },
+    {
+      "id": "TURN_PLAYER_CHOICE",
+      "x": 11,
+      "y": 7,
+      "z": 77,
+      "category": "turn",
+      "desc": "When a drawn card has multiple legal moves (multiple pegs eligible, or dual-function cards such as 6/A/Joker that can either release from holding OR move an existing peg), the player CHOOSES which move to make. The engine must NOT auto-pick a release, auto-pick the lexicographically-first peg, or auto-pick the 'optimal' move. Only when exactly one legal move exists (see TURN_AUTO_PLAY) may the engine resolve without player input.",
+      "assertion": "legalMoves.length > 1 ==> player.input_required",
+      "provenance": [
+        "user_directive_2026-05-20.R18_no_forced_releases_player_choice"
+      ]
+    },
+    {
+      "id": "TURN_AUTO_PLAY",
+      "x": 11,
+      "y": 8,
+      "z": 88,
+      "category": "turn",
+      "desc": "When exactly one legal move exists for the drawn card, the engine may auto-execute it without further player input (no UI prompt), then proceed to extra_turn_check. This applies to Card-7 split decisions only when there is exactly one legal (a,b)+(pegA,pegB) tuple. Combined with TURN_PLAYER_CHOICE: legalMoves==0 -> forfeit per TURN_NO_LEGAL_MOVE; legalMoves==1 -> auto; legalMoves>1 -> prompt player.",
+      "assertion": "legalMoves.length === 1 ==> engine.auto_execute(legalMoves[0])",
+      "provenance": [
+        "user_directive_2026-05-20.R21_auto_execute_unique_move"
+      ]
+    },
+    {
+      "id": "SPLIT_ANTI_TUNNELING",
+      "x": 2,
+      "y": 25,
+      "z": 50,
+      "category": "card",
+      "desc": "Card-7 split anti-tunneling: a split (a,b) on pegs (P1,P2) is illegal if its only effect (vs a direct 7-on-one-peg) is to bypass an own-peg blockade that a direct 7 could not legally cross. Formally: if P1 is blocked at distance k<7 by an own peg, the split (k-1, 8-k) on (P1, P2) is permitted ONLY when P2's b-step has its own independent tactical justification (lands on opponent for cut, lands legally in safe zone, completes arming, enters bullseye, etc.). The engine must reject splits whose sole purpose is to evade MOV_NO_PASS_OWN. This rule also forbids using the split to move an FT peg off the ring just to dodge an own FT-blockade.",
+      "assertion": "isSplit && split_evades_own_blockade(P1) && !split_has_independent_justification(P2) ==> illegal",
+      "provenance": [
+        "user_directive_2026-05-20.R12_anti_tunneling"
+      ]
+    }
+  ],
+  "variants_pending": {
+    "five_card_draw": "Awaiting authoritative rules from user before encoding.",
+    "two_dice": "Awaiting authoritative rules from user before encoding."
+  }
+}

@@ -1,0 +1,108 @@
+{
+  "manifold": "fasttrack",
+  "name": "FastTrack",
+  "version": "2.1.0",
+  "status": "production",
+  "dimension": {
+    "x": 3,
+    "y": 45,
+    "z": 135,
+    "_note": "z = x*y = 3 players avg * 45 min avg = 135"
+  },
+  "maxPlayers": 6,
+  "recommendedPlayers": 4,
+  "entry": "index.html",
+  "lobby": "lobby.html",
+  "join": "join.html",
+  "play": "play.html",
+  "substrates": {
+    "core": "fasttrack-game-core.js",
+    "manifold": "fasttrack_manifold_substrate.js",
+    "render3d": "fasttrack-3d.js",
+    "renderer3d": "schwarz_diamond_renderer.js",
+    "analytics": "analytics_substrate.js",
+    "growth": "growth_substrate.js",
+    "seo": "seo_substrate.js",
+    "avatars": "avatars.js"
+  },
+  "manifold_bridge": {
+    "entry_var": "window.__MANIFOLD__",
+    "schema_version": "1.0",
+    "exposes": [
+      "gameState",
+      "playerCount",
+      "roundTime",
+      "score"
+    ]
+  },
+  "server": {
+    "type": "node",
+    "lobby_port": 3001
+  },
+  "build": {
+    "test_files": [
+      "test_fasttrack_rules.js"
+    ],
+    "spec": "fasttrack_game_spec.json",
+    "assets": [
+      "*.html",
+      "*.js",
+      "*.css",
+      "assets/**",
+      "manifest.json"
+    ]
+  },
+  "platforms": {
+    "_note": "HR-40/41 — marquee game; all platform targets required",
+    "web": {
+      "url": "https://kensgames.com/fasttrack/",
+      "status": "live"
+    },
+    "steam": {
+      "wrapper": "electron/",
+      "appid_placeholder": "FASTTRACK_STEAM_APPID",
+      "status": "ready"
+    },
+    "windows": {
+      "wrapper": "electron/",
+      "build_cmd": "npm run build:win",
+      "status": "ready"
+    },
+    "macos": {
+      "wrapper": "electron/",
+      "build_cmd": "npm run build:mac",
+      "status": "ready"
+    },
+    "linux": {
+      "wrapper": "electron/",
+      "build_cmd": "npm run build:linux",
+      "status": "ready"
+    },
+    "ios": {
+      "wrapper": "capacitor",
+      "config": "capacitor.config.json",
+      "bundle_id": "com.butterflyfx.fasttrack",
+      "status": "ready"
+    },
+    "android": {
+      "wrapper": "capacitor",
+      "config": "capacitor.config.json",
+      "package": "com.butterflyfx.fasttrack",
+      "status": "ready"
+    }
+  },
+  "deploy": {
+    "target": "/var/www/kensgames.com/fasttrack/",
+    "type": "static_with_server"
+  },
+  "manifold_compatibility": {
+    "bridge_included": false,
+    "state_exposed": false,
+    "postmessage_protocol": "partial",
+    "todo": [
+      "Include js/manifold_bridge.js in index.html and play.html",
+      "Emit window.__MANIFOLD__ from game_engine_manifold.js",
+      "Wire postMessage events to ManifoldBridge.emit()"
+    ]
+  }
+}

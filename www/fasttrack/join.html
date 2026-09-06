@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <script src="/js/session-identity.js"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Join Fast Track Game</title>
+
+    <!--
+        STALE-CODE GUARD (2026-05-09):
+        This page no longer hosts its own join/auth/WebSocket flow. The
+        canonical lobby UI is /fasttrack/lobby-simple.html, which is mounted
+        via the shared substrate (KGGameSetup.mount in
+        /js/substrates/multiplayer_panel.js). This file exists ONLY to
+        forward legacy invite URLs (e.g. /invited/fasttrack/join.html?code=…
+        emitted by fasttrack/lobby_client.js historically) to the canonical
+        page. Do NOT add lobby/auth/WebSocket logic here — per AGENTS.md
+        directive: no single game owns its own check-in/game-creation logic.
+    -->
+    <script>
+        (function redirectLegacyJoin() {
+            var target = '/fasttrack/lobby-simple.html'
+                + (location.search || '')
+                + (location.hash || '');
+            location.replace(target);
+        })();
+    </script>
+    <meta http-equiv="refresh" content="0; url=/fasttrack/lobby-simple.html">
+    <link rel="icon" type="image/png" href="/assets/images/logo/icon.png">
+</head>
+
+<body>
+    <noscript>
+        <p>Redirecting to <a href="/fasttrack/lobby-simple.html">the FastTrack lobby</a>…</p>
+    </noscript>
+</body>
+
+</html>
