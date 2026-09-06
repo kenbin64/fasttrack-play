@@ -806,7 +806,6 @@ const CameraDirector = {
   }
 };
 
-// ════════════════════════════════════════════════════════════════
 // MOBILE STARFIELD (Google Play build only — window.FT_MOBILE === true)
 // A starry skydome replaces the speakeasy billiard room. The 3D board is
 // untouched; only the surrounding environment changes. Reuses the ceiling's
@@ -2668,7 +2667,14 @@ async function init3D() {
     // accepted only 'private', which silently dropped public games into a
     // 2-player solo+bot game per browser.
     const isLiveMode = (gameMode === 'private' || gameMode === 'public' || gameMode === 'multiplayer');
-    const useRuntimeRoster = isLiveMode && sameInviteSession && runtimeHasRoster;
+    // A runtime roster is authoritative in EVERY mode, not just the live ones.
+    // This used to require isLiveMode (private/public/multiplayer), so a solo or
+    // ai launch that HAD a full roster in kg_fasttrack_runtime had it ignored,
+    // and the game rebuilt a generic table instead of seating the players and
+    // bots the setup flow had just resolved. lobby-simple.html launches exactly
+    // that way: it persists the runtime with mode 'solo' and navigates to
+    // ?launch=1.
+    const useRuntimeRoster = sameInviteSession && runtimeHasRoster;
     const useSessionRoster = !useRuntimeRoster && isLiveMode && sameInviteSession && hasSessionRoster;
 
     // Same-screen: read full roster from runtime or ft_session_players
@@ -2708,6 +2714,13 @@ async function init3D() {
           avatar_id: p.avatar_id || (p.avatarObj && p.avatarObj.id) || null,
           is_ai: !!(p.is_ai || p.isAI || p.is_bot),
           is_host: !!p.is_host,
+          // Bot difficulty. initGame reads this off the session player
+          // (`sp.level || sp.aiDifficulty`) and it keys AI_PROFILES in the game
+          // core. It was being stripped here, so a difficulty chosen in the
+          // lobby never survived the handoff and every bot came up 'normal'.
+          level: (p.is_ai || p.isAI || p.is_bot)
+            ? (p.level || p.aiDifficulty || p.difficulty || null)
+            : null,
         })),
       }
       : { humanName, humanAvatar, aiDifficulty, launchMode: gameMode };
@@ -2784,6 +2797,43 @@ async function init3D() {
           }
         }
       };
+    }
+
+    // ── NO GAME, NO BOARD ────────────────────────────────────────────────
+    // The board must never render unless a game was actually created: players
+    // and bots chosen, and the host starting it. Opening 3d.html cold used to
+    // fall through to a synthesized 2-player game, so the board came up in a
+    // generic state with nobody real in it.
+    //
+    // A real launch always leaves a roster in sessionStorage, which is per-tab
+    // and therefore cannot be a leftover: the lobby writes kg_session or
+    // kg_fasttrack_runtime, same-screen and the solo setup write
+    // ft_session_players. localStorage keys like KG_Game are NOT an acceptable
+    // signal, because they survive across sessions and a stale one would look
+    // exactly like a fresh launch.
+    //
+    // dev_observer is the one deliberate exception: it builds its own all-AI
+    // roster above for recording, and is opted into explicitly by URL.
+    // A roster is the strongest signal, but not the only legitimate one. The
+    // lobby's own Play Solo button navigates to 3d.html?mode=solo&players=N
+    // with no roster at all, and that IS an intentional launch. What a cold
+    // open looks like is a bare URL with no query string whatsoever, so the
+    // presence of launch params is what separates the two.
+    // ?launch=1 is this codebase's established launch marker: see
+    // js/substrates/game_setup.js consumeRuntime(), which treats its absence as
+    // 'no game'. lobby-simple.html and the setup substrate both navigate with
+    // it. mode/players/session/code cover the older direct-link contract.
+    const launchedExplicitly = usp.get('launch') === '1'
+      || usp.has('mode') || usp.has('players')
+      || usp.has('session') || usp.has('code');
+
+    const hasRealRoster = useRuntimeRoster || useSessionRoster || useSameScreenRoster
+      || (Array.isArray(initConfig.sessionPlayers) && initConfig.sessionPlayers.length >= 2);
+
+    if (!hasRealRoster && !launchedExplicitly && !isDevObserver) {
+      console.warn('[ft] No game to render: reached the board without a roster from the lobby.');
+      showNoGamePanel();
+      return;
     }
 
     window.FastTrackCore.initGame(playerCount, initConfig);
@@ -2974,6 +3024,27 @@ async function init3D() {
           }
         };
 
+        // ── STATE ON EVERY DELTA ────────────────────────────────────────
+        // The core fires this after every draw, move and turn rotation. The
+        // host answers by publishing the resulting authoritative state, so all
+        // seats hold the SAME game rather than each re-simulating and drifting.
+        //
+        // The earlier objection to publishing this often was that snapshots
+        // teleported peer pegs mid-hop. That is no longer true: the receiving
+        // side buffers a snapshot while `isPlayResolving()` and flushes it once
+        // `waitForAnimations` drains, keeping only the latest frame (see the
+        // pending-snapshot buffer below). So state converges immediately while
+        // the visuals still finish the hop they were playing.
+        //
+        // publishAuthoritativeState already no-ops when we are not the host and
+        // dedupes on lastPublishedState, so a delta that changed nothing costs
+        // one JSON.stringify and no traffic.
+        try {
+          window.FastTrackCore.setStateCommittedHandler(() => publishAuthoritativeState());
+        } catch (err) {
+          console.warn('[ft-mp] could not register the state-committed publisher', err);
+        }
+
         const ensurePublisher = () => {
           if (statePublisherTimer) return;
           // Delta-only broadcast: every move/draw/turn_advance already goes
@@ -2983,6 +3054,8 @@ async function init3D() {
           // peer pegs mid-hop. Keep the periodic publisher only as a slow
           // catch-up safety net (5 s) — `lastPublishedState` dedupe means
           // it usually emits nothing.
+          // Now only a backstop: the delta hook above is the primary path.
+          // Kept so a dropped delta still reconciles within a few seconds.
           statePublisherTimer = setInterval(publishAuthoritativeState, 5000);
         };
         const ensureJoined = () => {
@@ -3011,6 +3084,10 @@ async function init3D() {
             // positions, producing chaotic motion. The periodic 5 s
             // catch-up publisher (with dedupe) is sufficient.
             window.FastTrackCore.applyRemoteAction(msg.action, msg.payload);
+            // applyRemoteAction runs the core, which fires the state-committed
+            // hook, which publishes when we are the host. Nothing extra needed
+            // here; this comment exists because the old code deliberately did
+            // NOT republish and the reason no longer holds.
           }
           catch (err) { console.warn('[ft-mp] applyRemoteAction failed', msg.action, err); }
         });
@@ -7049,3 +7126,36 @@ async function startInit3D() {
 
 // Auto-initialize when DOM ready
 document.addEventListener('DOMContentLoaded', startInit3D);
+
+// Shown instead of the board when someone reaches 3d.html without a game.
+// Plain DOM on purpose: this has to work even if three.js or the board never
+// initialised, which is exactly the situation it exists for.
+function showNoGamePanel() {
+  try {
+    if (document.getElementById('ft-no-game')) return;
+    const wrap = document.createElement('div');
+    wrap.id = 'ft-no-game';
+    wrap.setAttribute('role', 'alert');
+    wrap.style.cssText = [
+      'position:fixed', 'inset:0', 'z-index:100000',
+      'display:flex', 'align-items:center', 'justify-content:center',
+      'background:#0d0f14', 'color:#e9edf2',
+      'font:16px/1.6 system-ui,-apple-system,Segoe UI,sans-serif',
+      'padding:24px', 'text-align:center',
+    ].join(';');
+    wrap.innerHTML =
+      '<div style="max-width:460px">'
+      + '<h1 style="margin:0 0 10px;font-size:1.4rem;font-weight:650">No game to join</h1>'
+      + '<p style="margin:0 0 20px;color:#a8b3c1">'
+      + 'A FastTrack table is created in the lobby: pick your players and bots, '
+      + 'then the host starts the game. Opening the board directly does not make one.'
+      + '</p>'
+      + '<a href="/lobby/" style="display:inline-block;background:#0f6d94;color:#fff;'
+      + 'text-decoration:none;padding:.6rem 1.2rem;border-radius:8px;font-weight:600">'
+      + 'Go to the lobby</a>'
+      + '</div>';
+    document.body.appendChild(wrap);
+  } catch (err) {
+    console.error('[ft] could not show the no-game panel', err);
+  }
+}

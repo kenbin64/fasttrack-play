@@ -588,7 +588,14 @@ function initGame(playerCount = 2, config = {}) {
       name,
       avatar,
       userId: sp ? sp.user_id : null,
-      aiDifficulty: isBot ? (sp && (sp.level || sp.aiDifficulty || aiDifficulty)) : null,
+      // Per-seat level first, then the game-wide setting. The old form was
+      //   sp && (sp.level || sp.aiDifficulty || aiDifficulty)
+      // which short-circuits to undefined when there is no session player at
+      // all, so a solo game launched without a roster gave every bot a null
+      // difficulty and quietly ignored the one the player picked.
+      aiDifficulty: isBot
+        ? ((sp && (sp.level || sp.aiDifficulty)) || aiDifficulty || 'normal')
+        : null,
       color: PLAYER_COLORS[bp],
       boardPosition: bp,
       isBot,
@@ -677,7 +684,33 @@ function initGame(playerCount = 2, config = {}) {
         // uniformly random seat among ALL players; the randomiser is used ONLY
         // for the first game. Replays open on the previous winner (the rematch
         // branch above). No seat is privileged.
-        startingIdx = Math.floor(Math.random() * effectiveCount);
+        //
+        // BUGFIX 2026-09-05: this used a private Math.random(), so every client
+        // in a session picked its OWN starting seat and the participants began
+        // in different games before a single card was drawn. The deck was
+        // already derived from the shared session seed; the starting seat was
+        // not. That is the "everyone gets their own game" bug at its source, and
+        // it also reads as skipped turns, because each client believes a
+        // different seat is active. Reproduced by test_mp_convergence.js, which
+        // caught participants disagreeing on `current` at turn zero.
+        //
+        // The seat now blooms from the SAME shared seed as the deck, using a
+        // distinct sub-stream so it does not consume the deck's randomness.
+        const _seed = state.meta.get('seed');
+        const _codec = (typeof ManifoldCodec !== 'undefined' && ManifoldCodec)
+          || (typeof window !== 'undefined' && window.ManifoldCodec)
+          || (typeof globalThis !== 'undefined' && globalThis.ManifoldCodec)
+          || null;
+        if (_seed != null && _codec && typeof _codec.prng === 'function') {
+          startingIdx = Math.floor(_codec.prng(`${_seed}:startingSeat`)() * effectiveCount);
+        } else {
+          // Loud on purpose. A silent fallback here is what let the original
+          // divergence hide: the game looks fine locally and only breaks when a
+          // second participant disagrees.
+          console.warn('[INIT] no seeded RNG available — starting seat falls back to '
+            + 'Math.random() and will NOT match other clients in a session');
+          startingIdx = Math.floor(Math.random() * effectiveCount);
+        }
       }
     }
     state.players.set('current', startingIdx);
@@ -915,6 +948,32 @@ function applyStateSnapshot(snapshot) {
   updateUI();
   renderBoard();
   return true;
+}
+
+// ── STATE COMMIT HOOK ──────────────────────────────────────────────────────
+// Fires after any delta that changes authoritative game state: a draw, a move,
+// a turn rotation. The transport layer subscribes to it and broadcasts the
+// resulting state to every participant, which is what keeps all seats holding
+// the SAME game.
+//
+// Why a hook rather than calling the publisher directly: the core must stay
+// transport agnostic. It knows when state changed; it must not know whether
+// that goes out over Colyseus, the socket relay, or nothing at all in solo.
+//
+// It deliberately fires even while _applying is true. When the host replays a
+// peer's move it is _applying, but the result IS the authoritative outcome and
+// is exactly the delta the other seats need. Suppressing it there is what left
+// peers to re-simulate on their own and drift apart.
+let _onStateCommitted = null;
+
+function setStateCommittedHandler(fn) {
+  _onStateCommitted = typeof fn === 'function' ? fn : null;
+}
+
+function _commitState(reason) {
+  if (!_onStateCommitted) return;
+  try { _onStateCommitted(reason); }
+  catch (err) { console.warn('[ft-mp] state-committed handler failed', reason, err); }
 }
 
 function setMultiplayerClient(client) {
@@ -1213,6 +1272,31 @@ function applyRemoteAction(action, payload) {
         executeMove(0);
         break;
       }
+      case 'turn_done': {
+        // A non-host reports that its seat has finished. Only the host acts on
+        // it, because the host is the sole rotator.
+        //
+        // Idempotent by seat identity: if we already rotated (normally because
+        // we applied that player's move a moment earlier) then the seat named
+        // here is no longer the active one and this is a no-op. That is what
+        // lets the sender fire it unconditionally at the end of every non-host
+        // turn without any risk of double-advancing.
+        if (!_isHost()) break;
+        const players = state.players.get('list') || [];
+        const ci = state.players.get('current') || 0;
+        const cur = players[ci];
+        if (!cur) break;
+        const seatId = payload && payload.seatId != null ? String(payload.seatId) : null;
+        if (seatId && _seatIdentity(cur) !== seatId) {
+          console.log('[TURN] turn_done ignored — seat', seatId, 'already rotated off.');
+          break;
+        }
+        console.log('[TURN] turn_done from', seatId, '— host rotating on its behalf.');
+        // endTurn broadcasts turn_advance even under _applying (see _broadcast),
+        // which is exactly the path this needs.
+        endTurn(_turnEpoch);
+        break;
+      }
       case 'reshuffle': {
         const cards = payload && Array.isArray(payload.cards) ? payload.cards : null;
         if (!cards) break;
@@ -1360,6 +1444,7 @@ function _drawCardCommit(card) {
   _manifoldStateUpdate();
   calculateValidMoves();
   updateUI();
+  _commitState('draw');
 }
 
 function getCardDescription(v) {
@@ -2410,7 +2495,15 @@ function showMoveHints() {
             if ((state.turn.get('validMoves') || []).length > 0) return; // moves appeared
             if (state.turn.get('phase') === 'draw') return;        // already advanced
             if (_isMpMode() && !_isMyTurn()) return;               // no longer our turn
-            endTurn(_noMoveEpoch);                                 // epoch-verified (dropped if stale)
+            // resolveTurn, NOT endTurn. House rule: A, 6, J, Q, K and JOKER
+            // grant a redraw EVERY time they are drawn, and that holds even
+            // when the card produced no legal move. endTurn rotates
+            // unconditionally, so calling it here silently ate the redraw and
+            // handed the turn away, which is indistinguishable from a skipped
+            // turn to the player it happened to. resolveTurn is the single
+            // authority that knows the difference: replay card reopens the same
+            // seat, anything else rotates.
+            resolveTurn(_noMoveEpoch);                             // epoch-verified (dropped if stale)
           }, NO_MOVE_AUTO_PASS_MS);
         }
       }
@@ -2420,11 +2513,12 @@ function showMoveHints() {
       btn.addEventListener('click', () => {
         if (_isMpMode() && !_isMyTurn()) return;
         // Manual instant-out: cancel the pending auto-relinquish and end now.
-        // With validMoves empty there is no real move to play, so call endTurn
-        // directly — it advances + broadcasts turn_advance on the active
-        // player's client only.
+        // With validMoves empty there is no real move to play. Route through
+        // resolveTurn so a redraw card (A, 6, J, Q, K, JOKER) still grants its
+        // redraw rather than rotating the turn away; resolveTurn falls through
+        // to endTurn for every other card.
         _clearNoMoveAutoTimer();
-        endTurn(_turnEpoch);   // the live turn
+        resolveTurn(_turnEpoch);   // the live turn
       }, { once: true });
     }
     return;
@@ -3163,6 +3257,12 @@ function executeMove(moveIdx) {
   // only decides WHEN it runs. resolveTurn() drops the call if the turn has since
   // moved on (epoch changed) — a stale bot move can never advance the human.
   const _moveEpoch = _turnEpoch;
+  // The move is applied and the turn is resolving: publish the resulting state
+  // so every seat converges on it. Peers defer APPLYING a snapshot until their
+  // own hop animations drain (see the pending-snapshot buffer in
+  // fasttrack-3d.js), so publishing now cannot yank a peg mid-hop.
+  _commitState('move');
+
   const waitForAll = () => {
     const waitAnims = (cb) => window.waitForAnimations ? window.waitForAnimations(cb) : cb();
     waitAnims(() => {
@@ -3219,6 +3319,11 @@ function _replaySameSeat() {
   state.deck.set('currentCard', null);
   state.turn.set('phase', 'draw');
   updateUI();
+  // A replay card resolves the turn just as much as a rotation does: the card
+  // is cleared and the seat reopens for a fresh draw. Without this the last
+  // state peers received was the mid-move snapshot, so on every A/6/J/Q/K/JOKER
+  // they were left holding a card the host had already discarded.
+  _commitState('replay');
   if (cp && cp.isBot && (!_isMpMode() || _isHost())) setTimeout(botTurn, 800);
 }
 
@@ -3545,7 +3650,30 @@ function endTurn(epoch) {
       console.log('[TURN] host advanced turn. ci:', ci, '-> next:', next, 'nextId:', nextId, 'seq:', _turnSeq);
     } else {
       _localTurnUiCleanup();
-      console.log('[TURN] non-host endTurn — cleaned up; waiting for host turn_advance.');
+      // BUGFIX 2026-09-05 (skipped / stuck turns): tell the host this seat is
+      // finished.
+      //
+      // A non-host ends its turn through several paths that never produce a
+      // move: no legal moves for the drawn card, the manual end-turn button,
+      // the stuck watchdog, an idle relinquish. Every one of them lands here.
+      // Previously this branch cleaned up the local UI and returned, sending
+      // NOTHING. The host, which is the only seat allowed to rotate, was never
+      // told the turn was over, so it sat on that seat forever and the table
+      // stopped. Isolated and reproduced: a peer holding a 2 with all pegs in
+      // holding has zero legal moves, ends its turn, and not one byte goes on
+      // the wire.
+      //
+      // After a MOVE this is redundant, because the host rotates when it
+      // applies the broadcast move. Sending it anyway is deliberate and safe:
+      // the handler ignores it unless the reported seat is still the active
+      // one, so a late or duplicate turn_done can never rotate twice.
+      const _doneSeat = players[ci];
+      _broadcast('turn_done', {
+        seat: ci,
+        seatId: _seatIdentity(_doneSeat),
+        epoch: epoch !== undefined ? epoch : _turnEpoch,
+      });
+      console.log('[TURN] non-host endTurn — cleaned up; told the host this seat is done.');
     }
     return;
   }
@@ -3611,6 +3739,10 @@ function _applyTurnAdvance(fromCi, next, seq) {
   if (hintsDiv) hintsDiv.innerHTML = '';
   setOptionsPanelVisible(false);
   updateUI();
+
+  // The seat has rotated. Publish before the presentation chain below, so the
+  // authoritative turn reaches every seat without waiting on a camera or a blink.
+  _commitState('turn');
 
   // Gate: wait for camera to settle, THEN blink avatar 3 times, THEN enable turn
   const enableTurn = () => {
@@ -3688,6 +3820,161 @@ function _applyTurnAdvance(fromCi, next, seq) {
 function getCurrentPlayerName() {
   const players = state.players.get('list') || [];
   return players[state.players.get('current') || 0].name;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BOT STRATEGY — difficulty profiles and positional play
+// ═══════════════════════════════════════════════════════════════════════════
+// player.aiDifficulty was already set on every bot at init, but nothing read it,
+// so all four settings played identically. These profiles are what make the
+// setting mean something.
+//
+// DIFFICULTY IS THE CUTTING AXIS, per the house rules:
+//   easy    only cuts when there is no other legal move
+//   normal  cuts when it is strategically worth it
+//   hard    hunts other pegs, humans first, and will go out of its way to do it
+//   expert  hard, with sharper positional play on top
+//
+// Positional play is a separate thing from aggression, so it scales in by
+// weight rather than switching on and off.
+const AI_PROFILES = {
+  easy: {
+    cutMode: 'last-resort',
+    cutBonus: 0,
+    huntWeight: 0,
+    humanPreference: 0,
+    stagingWeight: 0,
+    bullseyeAppetite: 0.35,
+  },
+  normal: {
+    cutMode: 'strategic',
+    cutBonus: 0,            // the peg personality's own w.capture decides
+    huntWeight: 0,
+    humanPreference: 0,
+    stagingWeight: 45,
+    bullseyeAppetite: 1.0,
+  },
+  hard: {
+    cutMode: 'aggressive',
+    cutBonus: 55,
+    huntWeight: 40,
+    humanPreference: 35,
+    stagingWeight: 55,
+    bullseyeAppetite: 1.15,
+  },
+  expert: {
+    cutMode: 'aggressive',
+    cutBonus: 70,
+    huntWeight: 55,
+    humanPreference: 45,
+    stagingWeight: 70,
+    bullseyeAppetite: 1.25,
+  },
+};
+
+// How far a capture is pushed down when the profile says "last resort". It has
+// to exceed anything the rest of the scoring can award, so that ANY non-capture
+// outranks ANY capture. Only when every legal move is a cut does one win.
+const LAST_RESORT_CUT_PENALTY = 100000;
+
+function _aiProfile(player) {
+  const key = String((player && player.aiDifficulty) || 'normal').toLowerCase();
+  return AI_PROFILES[key] || AI_PROFILES.normal;
+}
+
+// Clockwise distance along the shared track from one hole to another. Null when
+// either hole is off the track (holding, safe zone, home, bullseye), because
+// distance is meaningless there.
+function _trackGap(fromHole, toHole) {
+  if (!fromHole || !toHole) return null;
+  const a = CLOCKWISE_TRACK.indexOf(fromHole);
+  const b = CLOCKWISE_TRACK.indexOf(toHole);
+  if (a < 0 || b < 0) return null;
+  const n = CLOCKWISE_TRACK.length;
+  return ((b - a) % n + n) % n;
+}
+
+// ── THE FOUR-BACK STAGING RULE ─────────────────────────────────────────────
+// A peg only becomes eligible for the safe zone by crossing its own entrance,
+// outer-{bp}-2. Card 4 moves BACKWARD, so a peg parked 1 to 4 holes PAST its
+// entrance can play a 4, cross back over it, and be eligible to enter the safe
+// zone on a later turn. That turns the 4 from a setback into a shortcut, and it
+// is the most useful piece of positional play in the game.
+//
+// Only worth anything to a peg that is not eligible yet. Once a peg has crossed,
+// parking there does nothing for it.
+const SAFE_ENTRY_STAGING_BAND = 4;
+
+function _holesPastSafeEntry(holeId, boardPosition) {
+  return _trackGap(`outer-${boardPosition}-2`, holeId);
+}
+
+function _isStagedForFour(holeId, boardPosition) {
+  const past = _holesPastSafeEntry(holeId, boardPosition);
+  return past !== null && past >= 1 && past <= SAFE_ENTRY_STAGING_BAND;
+}
+
+// Does this move land an opponent peg under one of ours?
+function _moveCutsSomeone(move, ci) {
+  const hit = (dest) => {
+    if (!dest) return false;
+    const occ = state.board.get(dest);
+    return !!(occ && occ.playerIdx !== ci);
+  };
+  return hit(move.dest) || (move.type === 'split' && hit(move.dest2));
+}
+
+// ── HUNTING (hard and expert) ──────────────────────────────────────────────
+// Closing on prey matters even when this turn cannot cut, because a peg sitting
+// a few holes behind an opponent threatens it on the next draw. Humans are
+// worth more than bots, because that is what makes a hard bot feel hard to a
+// person. Returns a bonus for ending at `dest`.
+function _huntBonus(dest, ci, players, profile) {
+  if (!profile.huntWeight || !dest) return 0;
+  let best = 0;
+  for (let pi = 0; pi < players.length; pi++) {
+    if (pi === ci) continue;
+    const isHuman = !players[pi].isBot;
+    for (const peg of players[pi].pegs) {
+      // Only pegs that can actually be cut are worth chasing.
+      if (peg.holeType === 'holding' || peg.holeType === 'safezone'
+        || peg.holeType === 'home') continue;
+      const d = _trackGap(dest, peg.holeId);
+      // d === 0 is the cut itself, scored elsewhere. Past ten holes the threat
+      // is too far off to steer for.
+      if (d === null || d === 0 || d > 10) continue;
+      const closeness = (11 - d) / 10;            // 1.0 adjacent, 0.1 at ten
+      let value = profile.huntWeight * closeness;
+      if (isHuman) value += profile.humanPreference * closeness;
+      if (value > best) best = value;
+    }
+  }
+  return best;
+}
+
+// ── HOW FAR BEHIND ARE WE ──────────────────────────────────────────────────
+// Used for the bullseye decision: a peg that is behind and needs a quick
+// advance can justify the risk of sitting in the centre. Returns 0 when this
+// player is leading and approaches 1 when they are furthest back.
+function _behindFactor(players, ci) {
+  const progress = (pl) => {
+    let n = 0;
+    for (const pg of pl.pegs) {
+      if (pg.holeType === 'home') n += 3;
+      else if (pg.holeType === 'safezone') n += 2;
+      else if (pg.holeType !== 'holding') n += 1;
+    }
+    return n;
+  };
+  const mine = progress(players[ci]);
+  let best = mine;
+  for (let pi = 0; pi < players.length; pi++) {
+    if (pi === ci) continue;
+    const p = progress(players[pi]);
+    if (p > best) best = p;
+  }
+  if (best <= 0) return 0;
+  return Math.max(0, Math.min(1, (best - mine) / best));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3810,6 +4097,20 @@ function botTurn() {
       const _bullseyeAdjust = Math.max(-90,
         _safeBoardBonus - _threatPenalty * (1 - _lateGameRatio * 0.7));
 
+      // ── DIFFICULTY + POSITIONAL STRATEGY ──────────────────────────────
+      const _profile = _aiProfile(player);
+      const _behind = _behindFactor(players, ci);
+      // "Less likely for someone to cut a peg on the bullseye when few other
+      // pegs are on the board", and "towards the end of the game a peg that is
+      // behind can take it for a quick advance". _bullseyeAdjust already
+      // measures the board; appetite scales it by difficulty and the behind
+      // term adds the catch-up case.
+      const _bullseyeBias = (_bullseyeAdjust * _profile.bullseyeAppetite)
+        + (_behind * 40 * _profile.bullseyeAppetite);
+      // Easy only cuts as a last resort, which is only meaningful if some other
+      // move exists. Computed once per turn, not per move.
+      const _anyNonCaptureMove = vm.some(mv => !_moveCutsSomeone(mv, ci));
+
       let bestIdx = 0, bestScore = -Infinity;
       for (let i = 0; i < vm.length; i++) {
         const m = vm[i];
@@ -3817,7 +4118,7 @@ function botTurn() {
 
         if (m.type === 'enterFastTrack') score += w.fasttrack + 50;
         else if (m.type === 'enterBullseye') {
-          score += w.fasttrack + 80 + _bullseyeAdjust;
+          score += w.fasttrack + 80 + _bullseyeBias;
           // FT peg → bullseye is usually wasteful: traversing FT is faster.
           // Only valuable if there's an opponent on bullseye to cut.
           const _enterPeg = player.pegs[m.pegIdx];
@@ -3906,7 +4207,7 @@ function botTurn() {
             // Bullseye landing — high-risk/high-reward: scaled by board state.
             // FT-peg-to-bullseye on a split is usually wasteful unless cutting.
             if (dest === 'bullseye') {
-              score += w.fasttrack + 50 + _bullseyeAdjust;
+              score += w.fasttrack + 50 + _bullseyeBias;
               m.toBullseye = true;
               const _movePeg = player.pegs[pegIdx];
               const _bOcc = state.board.get('bullseye');
@@ -3940,6 +4241,56 @@ function botTurn() {
               (_peg1?.onFasttrack && (m.dest === _ownFT || _path1.includes(_ownFT))) ||
               (_peg2?.onFasttrack && (m.dest2 === _ownFT || _path2b.includes(_ownFT)));
             if (_ftReached) score += 40;
+          }
+        }
+
+        // ── DIFFICULTY: how this bot feels about cutting ──────────────
+        const _cuts = _moveCutsSomeone(m, ci);
+        if (_cuts) {
+          if (_profile.cutMode === 'last-resort' && _anyNonCaptureMove) {
+            // Easy: never cut while anything else is playable. The penalty is
+            // larger than any bonus above it, so every non-capture outranks
+            // every capture. When all moves are cuts, one still wins.
+            score -= LAST_RESORT_CUT_PENALTY;
+          } else if (_profile.cutMode === 'aggressive') {
+            score += _profile.cutBonus;
+            // Hard and expert prefer a human's peg over a bot's.
+            if (_profile.humanPreference) {
+              for (const dest of [m.dest, m.dest2]) {
+                if (!dest) continue;
+                const occ = state.board.get(dest);
+                if (occ && occ.playerIdx !== ci && players[occ.playerIdx]
+                  && !players[occ.playerIdx].isBot) {
+                  score += _profile.humanPreference;
+                  break;
+                }
+              }
+            }
+          }
+        } else if (_profile.huntWeight) {
+          // No cut available on this move, so value getting CLOSE to prey. Only
+          // hard and expert do this, and it is what "goes out of its way" means.
+          score += _huntBonus(m.dest, ci, players, _profile);
+          if (m.type === 'split') score += _huntBonus(m.dest2, ci, players, _profile) * 0.6;
+        }
+
+        // ── POSITIONAL: the four-back staging rule ────────────────────
+        // Park a not-yet-eligible peg 1 to 4 holes past its own safe-zone
+        // entrance, so a Card 4 carries it back across and makes it eligible.
+        if (_profile.stagingWeight) {
+          const _stagePeg = player.pegs[m.pegIdx];
+          if (_stagePeg && !_stagePeg.eligibleForSafeZone
+            && _isStagedForFour(m.dest, _bpForBot)) {
+            score += _profile.stagingWeight;
+            m.stagesForFour = true;   // surfaced for LogicLens / debugging
+          }
+          if (m.type === 'split') {
+            const _stagePeg2 = player.pegs[m.peg2Idx];
+            if (_stagePeg2 && !_stagePeg2.eligibleForSafeZone
+              && _isStagedForFour(m.dest2, _bpForBot)) {
+              score += _profile.stagingWeight * 0.6;
+              m.stagesForFour = true;
+            }
           }
         }
 
@@ -4743,6 +5094,7 @@ window.FastTrackCore = {
   // Multiplayer wiring — set by 3d.html after initGame so the live KGMultiplayer
   // socket can broadcast moves and replay peer actions under the _applying guard.
   setMultiplayerClient,
+  setStateCommittedHandler,
   setMyUserId,
   updateSessionRoster,
   getStateSnapshot,
