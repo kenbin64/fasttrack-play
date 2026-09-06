@@ -499,7 +499,8 @@ function initGame(playerCount = 2, config = {}) {
   // Provisional — final starting seat is chosen AFTER the roster is built
   // (so winner-name lookup can match against the new roster). See the
   // "Starting-player selection" block lower in this function.
-  state.players.set('current', 0);
+  TurnManager.reset();
+  TurnManager.set(0, 'init');
   // Reset host-authoritative turn-rotation counters for the new game.
   _turnSeq = 0;
   _lastAppliedTurnSeq = 0;
@@ -596,6 +597,9 @@ function initGame(playerCount = 2, config = {}) {
       aiDifficulty: isBot
         ? ((sp && (sp.level || sp.aiDifficulty)) || aiDifficulty || 'normal')
         : null,
+      // Whose turn it is. Exactly one player in the array carries true.
+      // Only TurnManager._writeFlags may set this; nothing else writes it.
+      isTurn: false,
       color: PLAYER_COLORS[bp],
       boardPosition: bp,
       isBot,
@@ -713,13 +717,19 @@ function initGame(playerCount = 2, config = {}) {
         }
       }
     }
-    state.players.set('current', startingIdx);
+    TurnManager.set(startingIdx, 'init');
     if (window.CameraDirector) window.CameraDirector.setActivePlayer(startingIdx);
     log(`Starting player: ${players[startingIdx]?.name || `Seat ${startingIdx + 1}`}`);
   })();
 
   // ─── Peg Matrix (substrate) ───
   // peg(id) | color | position(hole) | state
+  // A snapshot replaces the players array wholesale, so the isTurn flags that
+  // arrived belong to the SENDER's array. Re-stamp them from the turn index,
+  // which is the value the snapshot is authoritative about.
+  try { TurnManager._writeFlags(TurnManager.current()); } catch (_) {}
+  // A snapshot legitimately relocates the turn; do not judge it as a jump.
+  try { TurnManager._history.push({ from: -1, to: TurnManager.current(), reason: 'restore', at: Date.now(), seats: TurnManager.count() }); } catch (_) {}
   syncPegMatrix();
 
   // Deck
@@ -3263,20 +3273,192 @@ function executeMove(moveIdx) {
   // fasttrack-3d.js), so publishing now cannot yank a peg mid-hop.
   _commitState('move');
 
+  // ── THE TURN IS NOT GIVEN UP UNTIL THE TURN IS FINISHED ──
+  // Every peg movement must land and every cutscene must play out before the
+  // seat is relinquished. For a Card 7 split that means BOTH hops, not just the
+  // first.
+  //
+  // This used to end with a flat `setTimeout(resolveTurn, 6000)` alongside the
+  // drain callback. That fallback fired whether or not anything was still
+  // running, so a long cutscene, or a slow machine dropping frames, had its turn
+  // taken away mid-scene. The safety net was cutting off legitimate play.
+  //
+  // Replaced with a watchdog that WATCHES rather than counts: it keeps waiting
+  // while animations or cutscenes are actually in progress, and only forces the
+  // issue when nothing has been progressing at all. A hard ceiling remains so a
+  // genuinely wedged animation can never freeze the table, and hitting it is
+  // logged loudly because it means something is broken, not merely slow.
   const waitForAll = () => {
     const waitAnims = (cb) => window.waitForAnimations ? window.waitForAnimations(cb) : cb();
     waitAnims(() => {
+      // Must happen BEFORE anything asks whether the table is busy. Until they
+      // are flushed these cutscenes exist only in this local buffer, so the
+      // cutscene queue would report itself empty and the turn could resolve in
+      // the gap before a cut or bullseye scene was ever queued.
       fireDeferredCutscenes();
-      // Resolve when the cutscene queue drains; the fallback guarantees the turn
-      // is never stranded if a cutscene fails to report "drained". Firing twice or
-      // late is harmless — resolveTurn() is idempotent by epoch.
+      // Both of these are only PROMPTS to try resolving. resolveTurn does the
+      // waiting itself and drops any call whose epoch is stale, so whichever
+      // arrives first wins and the rest are no-ops.
       CutsceneManager.whenDrained(() => resolveTurn(_moveEpoch));
-      setTimeout(() => resolveTurn(_moveEpoch), 6000);
+      resolveTurn(_moveEpoch);
     });
+    // waitForAnimations only fires its callback when the animation barrier
+    // comes down. If that never happens the callback above is lost, so prompt
+    // once from out here as well; resolveTurn waits for real motion to finish
+    // regardless of which prompt reaches it.
+    resolveTurn(_moveEpoch);
   };
   waitForAll();
 }
 
+// ═
+// TURN MANAGER — one owner of whose turn it is, and it checks itself
+// ═
+// Whose turn it is has exactly ONE representation: the index
+// state.players.current. Deliberately an index and not an isTurn boolean per
+// player, because an index CANNOT represent two seats holding the turn at once,
+// or none holding it. N booleans can, and then a desync between them is a whole
+// new class of bug. isTurn(i) below is derived from the index, so the two can
+// never disagree.
+//
+// What was missing was not a different data shape, it was ENFORCEMENT. Nothing
+// checked that the turn actually rotates by one, so a skipped seat left no
+// evidence and could only be caught by someone watching the screen. Every
+// change of turn now goes through set(), which validates the transition and
+// records it. A violation is logged loudly and kept, so a player who sees a
+// seat skipped can run FastTrackTurns.report() and hand over proof instead of
+// a description.
+const TurnManager = {
+  _history: [],      // every accepted transition, newest last
+  _violations: [],   // transitions that broke the rules
+  _max: 400,
+
+  seats() { return state.players.get('list') || []; },
+  count() { return this.seats().length; },
+  current() { const c = state.players.get('current'); return Number.isInteger(c) ? c : 0; },
+
+  /**
+   * Whose turn it is, read off the player's own isTurn flag.
+   * Exactly one player in the array carries true; every other carries false.
+   */
+  isTurn(seatIdx) {
+    const p = this.seats()[Number(seatIdx)];
+    return !!(p && p.isTurn);
+  },
+
+  /**
+   * Stamp the flags across the whole array in ONE pass: the seat at `idx` gets
+   * true, everyone else false. Writing them together is what keeps them
+   * consistent; nothing else in the codebase may set isTurn.
+   */
+  _writeFlags(idx) {
+    const seats = this.seats();
+    for (let i = 0; i < seats.length; i++) {
+      if (seats[i]) seats[i].isTurn = (i === Number(idx));
+    }
+  },
+
+  /**
+   * The invariant: exactly one player holds the turn, and it is the one the
+   * index names. Returns null when healthy, or a description when not.
+   */
+  checkFlags() {
+    const seats = this.seats();
+    if (!seats.length) return null;
+    const holders = [];
+    for (let i = 0; i < seats.length; i++) if (seats[i] && seats[i].isTurn) holders.push(i);
+    if (holders.length !== 1) {
+      return `${holders.length} players hold isTurn (${holders.join(',') || 'none'}); exactly 1 must`;
+    }
+    if (holders[0] !== this.current()) {
+      return `isTurn is on seat ${holders[0]} but the turn index says ${this.current()}`;
+    }
+    return null;
+  },
+
+  /** The seat whose turn it is, or null before the game starts. */
+  activeSeat() { return this.seats()[this.current()] || null; },
+
+  /** What the next seat must be. Pure round robin, no exceptions. */
+  nextSeat() { const n = this.count(); return n ? (this.current() + 1) % n : 0; },
+
+  /**
+   * The ONLY place the turn changes.
+   * reason: 'init' | 'advance' | 'restore'
+   *   init     game start, any seat is legal
+   *   advance  must be exactly the next seat in array order
+   *   restore  applying an authoritative snapshot from elsewhere
+   */
+  set(next, reason) {
+    const n = this.count();
+    const from = this.current();
+    const to = Number(next);
+    const entry = { from, to, reason, at: Date.now(), seats: n };
+
+    if (!Number.isInteger(to) || to < 0 || (n && to >= n)) {
+      entry.error = `seat ${next} is not a valid index for ${n} players`;
+    } else if (reason === 'advance' && n > 1) {
+      const expected = (from + 1) % n;
+      if (to !== expected) {
+        const skipped = [];
+        for (let s = (from + 1) % n; s !== to; s = (s + 1) % n) {
+          skipped.push(s);
+          if (skipped.length >= n) break;
+        }
+        entry.error = `turn jumped ${from} -> ${to}, expected ${expected}; skipped seat(s) ${skipped.join(',')}`;
+        entry.skipped = skipped;
+      }
+    }
+
+    if (entry.error) {
+      entry.stack = (new Error('turn-order violation')).stack;
+      this._violations.push(entry);
+      console.error('[TURN][VIOLATION]', entry.error);
+      console.error(entry.stack);
+      // Deliberately NOT blocked. Refusing the write here would freeze the game
+      // on a bad transition, which is worse than a skipped seat. Record and
+      // continue; the whole point is evidence, not enforcement by veto.
+    }
+
+    this._history.push(entry);
+    if (this._history.length > this._max) this._history.shift();
+    state.players.set('current', to);
+    this._writeFlags(to);
+
+    // The flags are the visible state, so they get checked every single time.
+    const flagProblem = this.checkFlags();
+    if (flagProblem) {
+      const bad = { from, to, reason, at: Date.now(), error: `isTurn invariant broken: ${flagProblem}`,
+                    stack: (new Error('isTurn invariant')).stack };
+      this._violations.push(bad);
+      console.error('[TURN][VIOLATION]', bad.error);
+    }
+    return to;
+  },
+
+  /** Hand to a player who just saw a seat skipped. */
+  report() {
+    const names = this.seats().map((p, i) => `${i}:${p.name}${p.isBot ? '(bot)' : ''}`);
+    return {
+      seats: names,
+      current: this.current(),
+      isTurnFlags: this.seats().map((p, i) => `${i}:${p.isTurn ? 'TRUE' : 'false'}`),
+      flagInvariant: this.checkFlags() || 'ok',
+      activeIsBot: !!(this.activeSeat() || {}).isBot,
+      violations: this._violations.slice(-20),
+      recent: this._history.slice(-40).map(h =>
+        `${h.from}->${h.to} (${h.reason})${h.error ? '  !! ' + h.error : ''}`),
+    };
+  },
+
+  reset() { this._history = []; this._violations = []; },
+};
+
+if (typeof window !== 'undefined') window.FastTrackTurns = TurnManager;
+// Exposed so the rule "a turn is not relinquished until the player has finished
+// moving" can be checked from outside, by a test or from the console, rather
+// than only being trusted.
+if (typeof window !== 'undefined') window.isTableBusy = () => _isTableBusy();
 // ══════════════════════════════════════════════════════════════════════════════
 // AUTHORITATIVE TURN MACHINE (user_directive_2026-07-18c)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -3298,11 +3480,61 @@ function _cardIsReplay(card) {
   return !!(r && r.extraTurn);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// IS THE TABLE STILL BUSY?
+// ───────────────────────────────────────────────────────────────────────────
+// A turn is not over when the move is APPLIED, it is over when the player has
+// finished MOVING. Peg hops and cutscenes both run after state has changed, so
+// a turn that rotates the moment the move lands hands over while the previous
+// player is still visibly moving across the board.
+//
+// This predicate is deliberately module level rather than local to executeMove,
+// because executeMove is not the only way a turn is given up. The no-move auto
+// pass, the manual end-turn button and the stuck-turn watchdog all relinquish
+// too, and each one used to do it on a bare timer with no idea whether anything
+// was still in motion. They all route through resolveTurn, so enforcing the
+// rule there covers every path with one check instead of four copies.
+function _isTableBusy() {
+  try {
+    if (typeof window !== 'undefined') {
+      if (typeof window.isPlayResolving === 'function' && window.isPlayResolving()) return true;
+    }
+  } catch (_) { /* an unreadable renderer counts as idle, never as stuck */ }
+  try {
+    if (CutsceneManager && (CutsceneManager.isPlaying
+        || (CutsceneManager.queue && CutsceneManager.queue.length > 0))) return true;
+  } catch (_) { /* same */ }
+  return false;
+}
+
+// How long to keep waiting, and how often to look. The ceiling exists so a
+// genuinely wedged animation can never freeze the table forever; reaching it
+// means something is broken rather than merely slow, so it is logged loudly.
+const TURN_SETTLE_POLL_MS = 120;
+const TURN_SETTLE_CEILING_MS = 45000;
+
 // Resolve the CURRENT turn exactly once. `epoch` was captured when the move was
 // made; if the turn has already moved on this call is stale and is dropped.
-function resolveTurn(epoch) {
+// `waitedMs` is internal: how long this particular resolve has already spent
+// waiting for the table to go quiet.
+function resolveTurn(epoch, waitedMs) {
   if (epoch !== _turnEpoch) return;              // stopgap verifier: stale / duplicate
   if (state.meta.get('winner') !== null) { _resolveWinner(); return; }
+
+  // -- THE RULE: no turn is relinquished while the table is still moving --
+  // Poll rather than subscribe, because the things being waited on are several
+  // independent systems (peg hops, deferred animation starts, the cutscene
+  // queue) with no single completion event between them.
+  if (_isTableBusy()) {
+    const waited = waitedMs || 0;
+    if (waited < TURN_SETTLE_CEILING_MS) {
+      setTimeout(() => resolveTurn(epoch, waited + TURN_SETTLE_POLL_MS), TURN_SETTLE_POLL_MS);
+      return;
+    }
+    console.warn('[TURN] settle ceiling reached after '
+      + Math.round(waited / 1000) + 's with animations or cutscenes still'
+      + ' reporting busy. Ending the turn to avoid a freeze; something is wedged.');
+  }
   const card = state.deck.get('currentCard');
   if (_cardIsReplay(card)) _replaySameSeat();    // replay → same seat draws again
   else endTurn(epoch);                           // deterministic round-robin advance (epoch-verified)
@@ -3714,7 +3946,9 @@ function _applyTurnAdvance(fromCi, next, seq) {
   console.log('[TURN] _applyTurnAdvance called. fromCi:', fromCi, 'next:', next, 'seq:', seq, 'players:', players.map(p => p && p.name));
 
   state.deck.set('currentCard', null);
-  state.players.set('current', next);
+  // Through the manager so a jump that is not exactly +1 is recorded with a
+  // stack trace instead of vanishing.
+  TurnManager.set(next, 'advance');
   _turnEpoch++; // new turn instance — any pending resolve for the old seat is now stale
   const _advEpoch = _turnEpoch; // this turn's epoch; the enable-gate below verifies against it
   // Turn boundary: cancel any pending no-legal-move auto-relinquish from the
@@ -3979,6 +4213,22 @@ function _behindFactor(players, ci) {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // BOT AI
+// ── BOT PACING — how long a bot takes, so a person can SEE it happen ──
+// A bot needs no time to decide anything; these pauses exist purely so the
+// table is followable. Previously 500 + 600 = 1.1s per bot turn, and with three
+// bots a whole round was over in about three seconds. Reported as bots being
+// 'skipped': the turn genuinely reached every seat, it was just gone before it
+// registered. A bot that FORFEITS is the worst case, because there is no peg
+// animation to watch either, just a toast.
+//
+// Tunable live from the console without a redeploy:
+//     FastTrackPace.think = 1400; FastTrackPace.decide = 1600;
+// Set both low (say 120) to fast-forward a game while testing.
+const BOT_PACE = {
+  think: 900,    // before the bot draws its card
+  decide: 1100,  // between the draw landing and the move being played
+};
+if (typeof window !== 'undefined') window.FastTrackPace = BOT_PACE;
 // ═══════════════════════════════════════════════════════════════════════════
 function botTurn() {
   // ── HARD GUARD (user_directive_2026-05-18: "bots taking over human turns")
@@ -4047,7 +4297,41 @@ function botTurn() {
         // when this bot turn began, so a stale/duplicate bot trigger is dropped
         // instead of double-advancing and skipping the next seat.
         log('🤖 Bot has no valid moves, ending turn.');
-        endTurn(_botEpoch);
+        // SHOW IT. A bot that moves is visible because its peg animates; a bot
+        // that forfeits used to show nothing at all and resolve in a few
+        // milliseconds, because bots never get the turn indicator
+        // (shouldShowIndicator is false for them). With three bots at the table
+        // that happens most rounds, and from the player's chair a seat that
+        // silently does nothing is indistinguishable from a seat being skipped.
+        // Reported exactly that way: "it ignores the 3rd bot".
+        //
+        // The toast is fire-and-forget. It deliberately does NOT delay endTurn:
+        // the turn machine must never wait on presentation, which is the bug
+        // class this file already suffers from elsewhere.
+        try {
+          const _bp = state.players.get('list') || [];
+          const _bc = _bp[state.players.get('current') || 0] || {};
+          const _bcard = state.deck.get('currentCard');
+          showCenterToast(
+            _bcard ? `${_bc.name || 'Bot'} drew ${_bcard.display} — no legal move`
+                   : `${_bc.name || 'Bot'} has no legal move`,
+            _bc.color || '#9fb0c4',
+            1600
+          );
+        } catch (_) { /* a missing toast must never block the turn */ }
+        // resolveTurn, NOT endTurn. Two things were wrong with going straight
+        // to endTurn here.
+        //
+        // 1. It is the one relinquish path that skipped the "wait until the
+        //    table has stopped moving" rule, so a bot with no legal move handed
+        //    the turn on in a few milliseconds while the previous player was
+        //    still visibly moving. Measured: every single mid-motion turn change
+        //    in a four seat game came through this line.
+        // 2. A, 6, J, Q, K and JOKER grant a redraw EVERY time they are drawn,
+        //    including when they produce no legal move. The human no-move path
+        //    already routes through resolveTurn and gets that redraw; this line
+        //    rotated unconditionally, so bots silently lost it.
+        resolveTurn(_botEpoch);
         return;
       }
 
@@ -4305,8 +4589,8 @@ function botTurn() {
       }
 
       executeMove(bestIdx);
-    }, 600);
-  }, 500);
+    }, BOT_PACE.decide);
+  }, BOT_PACE.think);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4938,6 +5222,12 @@ const CutsceneManager = {
     }
   }
 };
+
+// Exposed for the same reason as TurnManager. A top level const lives in the
+// script's lexical scope and never lands on the global, so anything outside
+// this file asking whether a cutscene was playing read undefined and quietly
+// got "no", including the check that holds a turn back until scenes finish.
+if (typeof window !== 'undefined') window.CutsceneManager = CutsceneManager;
 
 // ── Cutscene CSS animations ──
 (function injectCutsceneCSS() {

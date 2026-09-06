@@ -2,15 +2,6 @@
 <html lang="en">
 
 <head>
-  <!-- Google Play build flag. This fasttrack-play copy IS the mobile-only Play
-       version. FT_MOBILE now controls APPEARANCE ONLY: the starry skydome and
-       the void environment in place of the speakeasy room.
-       It no longer affects Card 7. As of 2026-09-04 both builds run one identical
-       core and the classic rule: one playable peg moves the full 7, and with two
-       or more playable pegs the 7 may be split a+b=7 across two of them. The
-       card rule is set by SEVEN_MODE in fasttrack-game-core.js, never by a build
-       flag. Set before any game script loads. -->
-  <script>window.FT_MOBILE = true;</script>
   <script src="/js/session-identity.js"></script>
   <script src="/js/kg-game-cache.js"></script>
   <meta charset="UTF-8">
@@ -53,10 +44,24 @@
   <!-- Header band: fixed strip hosting the deck (left: turn status, right: draw pile) -->
   <div id="ft-header-bg" aria-hidden="true"></div>
 
+  <!-- Google Play build flag. APPEARANCE ONLY: starry skydome and void room
+       in place of the speakeasy. The card rules come from SEVEN_MODE in
+       fasttrack-game-core.js, never from a build flag. Must be set before any
+       game script loads. -->
+  <script>window.FT_MOBILE = true;</script>
   <div id="container"></div>
 
   <!-- ── Footer band — full-width transparent strip hosting action / hints / cam ── -->
   <div id="ft-footer-bg" aria-hidden="true"></div>
+
+  <!-- ── Turn marquee — the seating order, scrolling in the footer strip.
+       Shows every player in ARRAY ORDER with the one holding isTurn lit up, so
+       whose turn it is, and who is next, is always visible. Bot turns can
+       resolve in milliseconds and previously left nothing on screen at all,
+       which is what made a fast bot turn look like a skipped seat. ── -->
+  <div id="ft-turn-marquee" role="status" aria-live="polite" aria-label="Turn order">
+    <div id="ft-turn-marquee-track"></div>
+  </div>
 
   <!-- ── Peg control bar — 5 peg buttons (per-peg nickname) + Confirm.
        Replaces text-based move hints / instruction banner. JS in 3d-ui.js
