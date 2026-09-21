@@ -6878,7 +6878,80 @@ function _pegIdxForPegId(pegId) {
   return idx >= 0 ? idx : null;
 }
 
-function _pickTargetAtClient(clientX, clientY) {
+// ════════════════════════════════════════════════════════════════
+// TOUCH INPUT
+// ════════════════════════════════════════════════════════════════
+// Two things made taps unreliable on a phone.
+//
+// OrbitControls is bound to the same canvas as the board handler, and on touch
+// it preventDefaults the gesture. If a finger drifts even a couple of pixels
+// between landing and lifting, the browser decides it was a drag and never
+// synthesises a 'click' at all, so the tap is silently lost. That is why it
+// worked sometimes: it depended on how still the finger was. So the board no
+// longer waits for 'click'. It watches pointerdown and pointerup itself and
+// decides what counts as a tap.
+//
+// And the pick was an exact ray against the mesh. A mouse is pixel accurate; a
+// fingertip covers forty or fifty pixels and the spot the player feels they
+// touched is not the spot the browser reports. Landing slightly off a peg
+// returned nothing. So a coarse pointer gets a ring of nearby tries before the
+// tap is given up on.
+//
+// The rules themselves are kept as plain functions with no DOM in them, so they
+// can be tested outside a browser. test_tap_input.js does exactly that.
+
+const TAP_SLOP_FINE = 6;      // a mouse barely moves between press and release
+const TAP_SLOP_COARSE = 14;   // a finger always moves
+const TAP_HOLD_MS = 600;      // longer than this and it was a hold, not a tap
+const TAP_PICK_SLOP = 24;     // how far from the finger to look for a target
+
+function _isCoarsePointer(pointerType) {
+  return pointerType === 'touch' || pointerType === 'pen';
+}
+
+function _tapSlopFor(pointerType) {
+  return _isCoarsePointer(pointerType) ? TAP_SLOP_COARSE : TAP_SLOP_FINE;
+}
+
+// Was that a tap, or was the player turning the camera? Anything that travelled
+// belongs to OrbitControls and is not ours to act on.
+function _isTap(down, up, pointerType) {
+  if (!down || !up) return false;
+  const moved = Math.hypot(up.x - down.x, up.y - down.y);
+  const held = up.t - down.t;
+  return moved <= _tapSlopFor(pointerType) && held <= TAP_HOLD_MS;
+}
+
+// Where to look for something pickable: the exact point first, then outward.
+function _tapRing(x, y, slopPx) {
+  const out = [{ x, y }];
+  if (!(slopPx > 0)) return out;
+  for (const r of [slopPx * 0.55, slopPx]) {
+    for (let a = 0; a < 8; a++) {
+      const th = (a / 8) * Math.PI * 2;
+      out.push({ x: x + Math.cos(th) * r, y: y + Math.sin(th) * r });
+    }
+  }
+  return out;
+}
+
+// Exposed so the tests can reach them without a browser.
+if (typeof window !== 'undefined') {
+  window.FastTrackInput = { _isTap, _tapRing, _tapSlopFor, _isCoarsePointer,
+    TAP_SLOP_FINE, TAP_SLOP_COARSE, TAP_HOLD_MS, TAP_PICK_SLOP };
+}
+
+// The tolerant picker. slopPx of 0 is the old exact behaviour, which is what
+// hover still wants: a hover that snapped to nearby pegs would feel possessed.
+function _pickTargetAtClient(clientX, clientY, slopPx = 0) {
+  for (const p of _tapRing(clientX, clientY, slopPx)) {
+    const hit = _pickTargetExact(p.x, p.y);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function _pickTargetExact(clientX, clientY) {
   if (!_pickRaycaster || !renderer || !camera) return null;
   const rect = renderer.domElement.getBoundingClientRect();
   _pickMouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
@@ -7145,14 +7218,41 @@ function setupBoardPickHandler() {
 
   dom.addEventListener('pointerleave', () => { clearHover(); });
 
-  dom.addEventListener('click', (e) => {
+  // A tap is decided here rather than waited for. See the TOUCH INPUT notes above:
+  // OrbitControls swallows 'click' on touch whenever the finger drifts, which is
+  // most of the time.
+  let _tapDown = null;
+  dom.addEventListener('pointerdown', (e) => {
+    _tapDown = { x: e.clientX, y: e.clientY, t: performance.now(), id: e.pointerId };
+  }, { passive: true });
+  dom.addEventListener('pointercancel', () => { _tapDown = null; }, { passive: true });
+  dom.addEventListener('pointerup', (e) => {
+    const down = _tapDown;
+    _tapDown = null;
+    if (!down || down.id !== e.pointerId) return;
+    const up = { x: e.clientX, y: e.clientY, t: performance.now() };
+    // Moved or held: the camera has it. Leave it alone and say nothing, because
+    // the player was turning the board and knows it.
+    if (!_isTap(down, up, e.pointerType)) return;
+    _handleBoardTap(e.clientX, e.clientY, e.pointerType);
+  });
+
+  function _handleBoardTap(clientX, clientY, pointerType) {
     if (artOverlayOpen()) return;
     const idx = _refreshRouteIndex();
-    if (idx.size === 0) return;
-    const target = _pickTargetAtClient(e.clientX, e.clientY);
+    if (idx.size === 0) { _sayBoardHint(_whyNothingToPick()); return; }
+    const slop = _isCoarsePointer(pointerType) ? TAP_PICK_SLOP : 0;
+    const target = _pickTargetAtClient(clientX, clientY, slop);
+    if (!target) { _sayBoardHint('Nothing there. Tap a peg or a hole.'); return; }
     const matches = _entriesForTarget(target, idx);
-    if (matches.length === 0) return;
+    if (matches.length === 0) {
+      _sayBoardHint(target.kind === 'peg'
+        ? 'That peg has no move this turn.'
+        : 'No move reaches that hole.');
+      return;
+    }
     _hideHoverTip();
+    const e = { clientX, clientY };
     // Board click is a shortcut — sync the cycle to this target.
     const tKey = target ? (target.kind === 'peg' ? `peg:${target.pegIdx}` : `hole:${target.holeId}`) : '';
     let nextIdx = 0;
@@ -7171,10 +7271,17 @@ function setupBoardPickHandler() {
     // re-clicking the same target after it's already staged commits.
     const isReclick = _pendingEntry && _entryKey(_pendingEntry) === _entryKey(entry);
     _stagePendingEntry(entry);
-    if (matches.length === 1 || isReclick) {
+    if (matches.length === 1) {
+      // Only one way through here, so there is nothing to ask about.
       _commitPendingEntry();
+    } else if (isReclick) {
+      _commitPendingEntry();
+    } else {
+      // Several moves run through what was tapped. Rather than make the player
+      // cycle blind with the arrows, show them and let one be chosen.
+      _showMoveChoices(matches, target);
     }
-  });
+  }
 
   // Footer toolbar buttons — primary input on touch and desktop.
   const okBtn = document.getElementById('ft-confirm-ok');
@@ -7200,6 +7307,147 @@ function setupBoardPickHandler() {
   // Initialize the bar state for whatever moves are currently available.
   _refreshRouteIndex();
   _refreshConfirmBar();
+}
+
+// ── Telling the player what happened ───────────────────────────
+// Every path that used to end in a bare `return` now ends here instead. A tap
+// that does nothing and says nothing is indistinguishable from a broken game,
+// and that is most of what "it doesn't acknowledge my choice" actually was.
+
+let _hintTimer = null;
+
+function _boardHintEl() {
+  let el = document.getElementById('ft-board-hint');
+  if (el) return el;
+  el = document.createElement('div');
+  el.id = 'ft-board-hint';
+  el.setAttribute('role', 'status');
+  el.setAttribute('aria-live', 'polite');
+  el.style.cssText = [
+    'position:fixed', 'left:50%', 'transform:translateX(-50%)',
+    'bottom:calc(env(safe-area-inset-bottom, 0px) + 92px)',
+    'background:rgba(12,16,22,.92)', 'color:#eef3fa',
+    'border:1px solid rgba(255,255,255,.18)', 'border-radius:.6rem',
+    'padding:.55rem .95rem', 'font:600 15px/1.35 system-ui,-apple-system,sans-serif',
+    'max-width:min(90vw,26rem)', 'text-align:center', 'pointer-events:none',
+    'opacity:0', 'transition:opacity .16s ease', 'z-index:60',
+  ].join(';');
+  document.body.appendChild(el);
+  return el;
+}
+
+function _sayBoardHint(message) {
+  if (!message) return;
+  const el = _boardHintEl();
+  el.textContent = message;
+  el.style.opacity = '1';
+  if (_hintTimer) clearTimeout(_hintTimer);
+  _hintTimer = setTimeout(() => { el.style.opacity = '0'; _hintTimer = null; }, 2200);
+}
+
+// Why is there nothing to pick? The route index being empty has several very
+// different causes and the player deserves to know which one.
+function _whyNothingToPick() {
+  const core = window.FastTrackCore;
+  if (!core || !core.state) return 'Waiting for the game to start.';
+  const players = core.state.players.get('list') || [];
+  const ci = core.state.players.get('current') || 0;
+  const cur = players[ci];
+  if (cur && cur.isBot) return `${cur.name || 'The bot'} is taking their turn.`;
+  const vm = _currentValidMoves();
+  if (!vm || vm.length === 0) return 'No legal move with this card.';
+  return 'Draw a card to begin your turn.';
+}
+
+// ── Choosing between several moves ─────────────────────────────
+// user_directive: when more than one move runs through the peg or hole that was
+// tapped, ask which one rather than making the player cycle through them blind.
+// Previewing on the board as each is considered, so the list and the board agree.
+
+let _choiceBox = null;
+
+function _hideMoveChoices() {
+  if (_choiceBox) { _choiceBox.remove(); _choiceBox = null; }
+}
+
+function _showMoveChoices(matches, target) {
+  _hideMoveChoices();
+  if (!matches || matches.length < 2) return;
+  const vm = _currentValidMoves();
+
+  const box = document.createElement('div');
+  _choiceBox = box;
+  box.id = 'ft-move-choices';
+  box.setAttribute('role', 'dialog');
+  box.setAttribute('aria-modal', 'true');
+  box.setAttribute('aria-label', 'Choose which move');
+  box.style.cssText = [
+    'position:fixed', 'inset:0', 'z-index:70', 'display:flex',
+    'align-items:center', 'justify-content:center',
+    'background:rgba(6,9,13,.55)', 'padding:16px',
+  ].join(';');
+
+  const panel = document.createElement('div');
+  panel.style.cssText = [
+    'background:#131922', 'color:#eef3fa', 'border:1px solid rgba(255,255,255,.16)',
+    'border-radius:.8rem', 'padding:.9rem', 'width:min(92vw,24rem)',
+    'max-height:min(78vh,34rem)', 'overflow-y:auto',
+    'font:15px/1.45 system-ui,-apple-system,sans-serif',
+    'box-shadow:0 18px 50px rgba(0,0,0,.55)',
+  ].join(';');
+
+  const title = document.createElement('p');
+  title.textContent = target && target.kind === 'peg'
+    ? `${matches.length} moves for this peg` : `${matches.length} moves reach that hole`;
+  title.style.cssText = 'margin:.1rem 0 .7rem;font-weight:700;font-size:1rem';
+  panel.appendChild(title);
+
+  matches.forEach((entry, i) => {
+    const desc = _describeEntry(entry, vm);
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = (desc && desc.text) ? desc.text : `Move ${i + 1}`;
+    // Big enough for a thumb, which is the whole point of this box.
+    b.style.cssText = [
+      'display:block', 'width:100%', 'text-align:left', 'margin:0 0 .45rem',
+      'padding:.7rem .8rem', 'min-height:44px', 'border-radius:.55rem',
+      'border:1px solid rgba(255,255,255,.18)', 'background:#1b2330',
+      'color:#eef3fa', 'font:inherit', 'cursor:pointer',
+    ].join(';');
+    if (desc && desc.color) b.style.borderLeft = `4px solid ${desc.color}`;
+    // Show it on the board while it is being considered.
+    const preview = () => { try { _stagePendingEntry(entry); } catch (err) {} };
+    b.addEventListener('pointerenter', preview);
+    b.addEventListener('focus', preview);
+    b.addEventListener('click', () => {
+      _hideMoveChoices();
+      _stagePendingEntry(entry);
+      _commitPendingEntry();
+    });
+    panel.appendChild(b);
+  });
+
+  const cancel = document.createElement('button');
+  cancel.type = 'button';
+  cancel.textContent = 'Cancel';
+  cancel.style.cssText = [
+    'display:block', 'width:100%', 'margin-top:.35rem', 'padding:.65rem',
+    'min-height:44px', 'border-radius:.55rem', 'border:1px solid rgba(255,255,255,.14)',
+    'background:transparent', 'color:#9fb0c4', 'font:inherit', 'cursor:pointer',
+  ].join(';');
+  cancel.addEventListener('click', () => { _hideMoveChoices(); _clearPendingEntry(true); });
+  panel.appendChild(cancel);
+
+  box.appendChild(panel);
+  box.addEventListener('click', (ev) => {
+    if (ev.target === box) { _hideMoveChoices(); _clearPendingEntry(true); }
+  });
+  document.addEventListener('keydown', function esc(ev) {
+    if (ev.key === 'Escape') { _hideMoveChoices(); _clearPendingEntry(true); document.removeEventListener('keydown', esc); }
+  });
+  document.body.appendChild(box);
+  const first = panel.querySelector('button');
+  if (first) first.focus();
 }
 
 // ── Confirmation staging ───────────────────────────────────────
@@ -7405,7 +7653,13 @@ function _commitPendingEntry() {
   // _refreshRouteIndex() on the next tick will rebuild the cycle for the new state.
 }
 window._clearPendingEntry = () => _clearPendingEntry(true);
-window._refreshFastTrackToolbar = () => { _refreshRouteIndex(); _refreshConfirmBar(); };
+window._refreshFastTrackToolbar = () => {
+  // A choice box left standing after the state moved on would offer moves that
+  // no longer exist, so it goes whenever the toolbar is rebuilt.
+  _hideMoveChoices();
+  _refreshRouteIndex();
+  _refreshConfirmBar();
+};
 
 // ════════════════════════════════════════════════════════════════
 // 🜂 MANIFOLD SUBSTRATE INTEGRATION

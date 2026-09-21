@@ -4114,3 +4114,14 @@ textarea,
 }
 .ft-mq-seat .ft-mq-tag { opacity: .6; font-weight: 500; font-size: 11px; }
 .ft-mq-sep { color: rgba(233, 237, 242, .25); }
+
+/* ── Touch: the board owns its gestures ──────────────────────────
+   Without this the browser is free to read a tap as the start of a scroll or a
+   pinch and never deliver it to the game, which is one half of why taps were
+   being lost on a phone. The other half was waiting for a 'click' that
+   OrbitControls suppresses; see the TOUCH INPUT notes in fasttrack-3d.js. */
+canvas { touch-action: none; }
+
+/* The choice box and the hint sit above the board furniture. */
+#ft-move-choices { -webkit-tap-highlight-color: transparent; }
+#ft-move-choices button:focus-visible { outline: 3px solid #00c8ff; outline-offset: 2px; }
