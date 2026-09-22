@@ -243,5 +243,48 @@ check('the canvas claims its own touch gestures',
     'putting it inside broke the purity check, which is the check working');
 }
 
+// ─── One file for both builds ─────────────────────────────────
+// 3d.html used to carry `window.FT_MOBILE = true` as a literal, which meant the
+// web copy and the packaged copy differed by a source edit somebody had to
+// remember not to deploy. These make sure that cannot come back.
+{
+  const html = fs.readFileSync(path.join(__dirname, '3d.html'), 'utf8');
+
+  check('3d.html does not hard code the build flag any more',
+    !/window\.FT_MOBILE\s*=\s*true\s*;/.test(html),
+    'a literal there is the whole reason the two trees diverged');
+
+  check('it works the flag out from the native shell instead',
+    /window\.Capacitor/.test(html) && /isNativePlatform/.test(html) &&
+    /window\.FT_MOBILE = native;/.test(html),
+    'so one file serves the web and the store builds');
+
+  check('and either mode can be forced, for testing on the wrong machine',
+    /FT_FORCE_DESKTOP/.test(html) && /FT_FORCE_TOUCH/.test(html) &&
+    /FT_FORCE_DESKTOP === true/.test(src) && /FT_FORCE_TOUCH === true/.test(src),
+    'honoured in both the page and the game');
+
+  check('the detection cannot throw and take the page with it',
+    /try \{[\s\S]{0,260}catch \(e\) \{\}/.test(html),
+    'window.Capacitor is absent on the web, and reading into it must not be fatal');
+
+  // The stale claim that started this: FT_MOBILE was documented as controlling
+  // appearance, and it has not for a long time.
+  // This check took three attempts and each failure was the instrument.
+  //   1. `FT_BILLIARD_ROOM\s*=` matched the first `=` of `=== true` in the code
+  //      that READS the flag.
+  //   2. Adding (?!=) still matched a comment documenting the flag, and the local
+  //      `const FT_BILLIARD_ROOM = ...` that reads window into it.
+  // What is actually being claimed is narrower: nothing assigns to the WINDOW
+  // property, so the opt-in never happens and the void room is every build.
+  const strip = (t) => t.replace(/\/\*[\s\S]*?\*\//g, '')
+                        .replace(/<!--[\s\S]*?-->/g, '')
+                        .replace(/\/\/.*$/gm, '');
+  const assignsWindow = /window\.FT_BILLIARD_ROOM\s*=(?!=)/;
+  check('nothing assigns window.FT_BILLIARD_ROOM, so the void room is already every build',
+    !assignsWindow.test(strip(src)) && !assignsWindow.test(strip(html)),
+    'which is why the flag was inert for art, and why the old comment claiming it changed the room was wrong');
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

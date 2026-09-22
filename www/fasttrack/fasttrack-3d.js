@@ -6951,6 +6951,9 @@ if (typeof window !== 'undefined') {
 let _touchFirstCache = null;
 function _touchFirst() {
   if (_touchFirstCache !== null) return _touchFirstCache;
+  // An explicit override wins, for testing either mode on either machine.
+  if (window.FT_FORCE_DESKTOP === true) { _touchFirstCache = false; return false; }
+  if (window.FT_FORCE_TOUCH === true) { _touchFirstCache = true; return true; }
   let coarse = false;
   try { coarse = window.matchMedia('(pointer: coarse)').matches; } catch (e) {}
   _touchFirstCache = window.FT_MOBILE === true || coarse;
