@@ -1,0 +1,21 @@
+{
+  "name": "fasttrack-play",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FastTrack, packaged for Android and iOS. The web app in www/ is the whole game; Capacitor wraps it unchanged so kensgames.com and the stores serve the same code.",
+  "scripts": {
+    "sync": "node scripts/prepare-mobile.mjs",
+    "open:android": "cap open android",
+    "test": "node scripts/run-tests.mjs",
+    "prepare:mobile": "node scripts/prepare-mobile.mjs"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.2.0",
+    "@capacitor/core": "^6.2.0",
+    "@capacitor/splash-screen": "^6.0.3",
+    "@capacitor/status-bar": "^6.0.2"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.2.0"
+  }
+}
