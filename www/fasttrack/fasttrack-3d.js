@@ -6941,6 +6941,23 @@ if (typeof window !== 'undefined') {
     TAP_SLOP_FINE, TAP_SLOP_COARSE, TAP_HOLD_MS, TAP_PICK_SLOP };
 }
 
+// Touch first: the Play build sets FT_MOBILE, and a phone browser reports a
+// coarse pointer. Either way the bottom toolbar goes and the board becomes the
+// only control. Tapping is the whole interface: one move commits, several open a
+// list, and tapping nothing backs out.
+//
+// The desktop keeps its toolbar. This is a different way to play rather than a
+// replacement for the old one.
+let _touchFirstCache = null;
+function _touchFirst() {
+  if (_touchFirstCache !== null) return _touchFirstCache;
+  let coarse = false;
+  try { coarse = window.matchMedia('(pointer: coarse)').matches; } catch (e) {}
+  _touchFirstCache = window.FT_MOBILE === true || coarse;
+  return _touchFirstCache;
+}
+if (typeof window !== 'undefined') window.FastTrackTouchFirst = _touchFirst;
+
 // The tolerant picker. slopPx of 0 is the old exact behaviour, which is what
 // hover still wants: a hover that snapped to nearby pegs would feel possessed.
 function _pickTargetAtClient(clientX, clientY, slopPx = 0) {
@@ -7243,7 +7260,19 @@ function setupBoardPickHandler() {
     if (idx.size === 0) { _sayBoardHint(_whyNothingToPick()); return; }
     const slop = _isCoarsePointer(pointerType) ? TAP_PICK_SLOP : 0;
     const target = _pickTargetAtClient(clientX, clientY, slop);
-    if (!target) { _sayBoardHint('Nothing there. Tap a peg or a hole.'); return; }
+    if (!target) {
+      // With no cancel button on a phone, tapping the empty board is how you back
+      // out. Mid split that walks the split state machine back a stage, which is
+      // what the cancel button used to do.
+      if (_touchFirst() && (_pendingEntry || _getSplitChoice())) {
+        _hideMoveChoices();
+        _clearPendingEntry(true);
+        _sayBoardHint('Cleared. Tap a glowing peg to start again.');
+        return;
+      }
+      _sayBoardHint('Nothing there. Tap a peg or a hole.');
+      return;
+    }
     const matches = _entriesForTarget(target, idx);
     if (matches.length === 0) {
       _sayBoardHint(target.kind === 'peg'
@@ -7272,9 +7301,12 @@ function setupBoardPickHandler() {
     const isReclick = _pendingEntry && _entryKey(_pendingEntry) === _entryKey(entry);
     _stagePendingEntry(entry);
     if (matches.length === 1) {
-      // Only one way through here, so there is nothing to ask about.
+      // Only one way through here, so there is nothing to ask about. It just moves.
       _commitPendingEntry();
-    } else if (isReclick) {
+    } else if (isReclick && !_touchFirst()) {
+      // On a mouse, tapping the same target twice was how you accepted the staged
+      // move. On a phone that is a trap: the list is the only place a choice gets
+      // made, so a second tap reopens it rather than quietly playing something.
       _commitPendingEntry();
     } else {
       // Several moves run through what was tapped. Rather than make the player
@@ -7517,7 +7549,7 @@ function _refreshInstructionBanner() {
       // button is live), swap the "tap a glowing…" prompt for the
       // confirm-move description so the player knows exactly what they
       // are about to commit.
-      if (_pendingEntry) {
+      if (_pendingEntry && !_touchFirst()) {
         const desc = _describeEntry(_pendingEntry, _currentValidMoves());
         if (desc && desc.text) {
           text = `Confirm move: ${desc.text}`;
@@ -7527,6 +7559,14 @@ function _refreshInstructionBanner() {
           text = 'Confirm move';
           icon = '✓';
         }
+      } else if (_pendingEntry) {
+        // Touch first has nothing to confirm: a staged move is only ever a
+        // preview under the open list, and choosing from the list commits it.
+        // Telling the player to confirm would point at a button that is gone.
+        const desc = _describeEntry(_pendingEntry, _currentValidMoves());
+        text = desc && desc.text ? desc.text : 'Choose a move';
+        icon = '👆';
+        if (desc && desc.color) accent = desc.color;
       } else if (kind === 'split-first-peg') {
         text = total > 1 ? 'Tap a glowing peg to split your 7' : 'Splitting your 7…';
       } else if (kind === 'split-first') {
@@ -7565,7 +7605,12 @@ function _refreshConfirmBar() {
   // Show the bar whenever the move cycle has any entries; hide otherwise.
   // (Bots clear validMoves before they animate, so this never lights up
   // during a bot turn.)
-  const shouldShow = total > 0;
+  //
+  // On a phone it never shows at all. The prev, next, cancel and confirm buttons
+  // are a mouse idea: they exist so a pointer can cycle through moves it cannot
+  // easily point at. A finger can point at the board directly, so the board is
+  // the interface and the buttons are in the way of it.
+  const shouldShow = total > 0 && !_touchFirst();
   if (shouldShow) {
     bar.removeAttribute('hidden');
     bar.hidden = false;

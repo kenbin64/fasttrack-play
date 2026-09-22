@@ -195,5 +195,53 @@ check('the canvas claims its own touch gestures',
   /canvas\s*\{[^}]*touch-action:\s*none/.test(css),
   'without this the browser can read a tap as the start of a scroll and never deliver it');
 
+// ─── Touch first: the phone plays differently ────────────────
+// user_directive: on a smartphone the bottom toolbar and the confirm tick go
+// away entirely. The board is the whole interface. One move just plays; several
+// open a list; tapping nothing backs out. The desktop keeps its toolbar, so this
+// is a second way to play rather than a replacement.
+{
+  check('the toolbar is suppressed entirely when touch is the primary input',
+    /const shouldShow = total > 0 && !_touchFirst\(\);/.test(src),
+    'prev, next, cancel and confirm are a mouse idea and a finger does not need them');
+
+  check('touch first is decided by the Play build flag OR a coarse pointer',
+    /window\.FT_MOBILE === true \|\| coarse/.test(src) &&
+    /matchMedia\('\(pointer: coarse\)'\)/.test(src),
+    'so it covers the packaged app and a phone browser alike');
+
+  check('and it is read once and remembered, not queried every frame',
+    /_touchFirstCache/.test(src));
+
+  check('a single move still just plays, with nothing to confirm',
+    /if \(matches\.length === 1\) \{[\s\S]{0,200}_commitPendingEntry\(\);/.test(src));
+
+  check('several moves open the list, which is the only place a choice gets made',
+    /_showMoveChoices\(matches, target\)/.test(src));
+
+  check('tapping the same target twice does NOT quietly commit on touch',
+    /isReclick && !_touchFirst\(\)/.test(src),
+    'that was a mouse affordance and on a phone it plays a move nobody chose');
+
+  check('tapping empty board backs out, since there is no cancel button left',
+    /_touchFirst\(\) && \(_pendingEntry \|\| _getSplitChoice\(\)\)/.test(src) &&
+    /Cleared\. Tap a glowing peg/.test(src),
+    'and mid split it walks the split back a stage, which is what cancel used to do');
+
+  check('the banner stops telling the player to confirm when there is no confirm button',
+    /_pendingEntry && !_touchFirst\(\)/.test(src) &&
+    /Touch first has nothing to confirm/.test(src),
+    'pointing at a button that is gone is worse than saying nothing');
+
+  // The purity rule again, for the new helper: it reads window, so it must sit
+  // OUTSIDE the block this test evaluates bare. It was inside at first and this
+  // caught it.
+  const pureBlock = src.slice(src.indexOf('const TAP_SLOP_FINE'),
+                              src.indexOf('// Exposed so the tests can reach them'));
+  check('the touch first check lives OUTSIDE the DOM free block, because it reads window',
+    !/_touchFirst/.test(pureBlock) && /_touchFirstCache/.test(src),
+    'putting it inside broke the purity check, which is the check working');
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
